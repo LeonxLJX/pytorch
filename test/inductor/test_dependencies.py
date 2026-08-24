@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 import contextlib
+from unittest.mock import Mock, patch
 
 import torch
 from torch._inductor.codegen.cpp_utils import CppCSEVariable
@@ -128,8 +129,7 @@ class TestDependencies(InductorTestCase):
         """
         A masked store is deliberately recorded as a full write over the
         expanded domain. That over-approximation is what keeps WAW/WAR ordering
-        edges intact; the resulting imprecision is handled by refusing in-place
-        reuse (see SchedulerNode.can_inplace).
+        edges intact. Masked-off coordinates are outside the logical output.
         """
         from torch._inductor.dependencies import extract_read_writes
 
@@ -147,15 +147,21 @@ class TestDependencies(InductorTestCase):
         self.assertEqual(writes[0].get_numel(), 64)
         self.assertEqual(writes[0].mode, None)
 
-    def test_masked_store_disables_inplace_reuse(self):
+    def test_masked_expansion_rejects_non_plain_store_modes(self):
         body = object.__new__(LoopBody)
-        body.op_counts = {"masked_store": 1}
         node = object.__new__(SchedulerNode)
         node._body = body
-        node.node = None
-        node.outputs = []
+        store = Mock(
+            op="call_method",
+            target="store",
+            kwargs={"name": "buf0", "mode": "atomic_max"},
+            args=(),
+        )
 
-        self.assertFalse(node.can_inplace(object()))
+        with patch.object(LoopBody, "get_nodes", return_value=[store]):
+            buffers = node._get_non_plain_store_buffers()
+
+        self.assertEqual(set(buffers), {"buf0"})
 
     def test_get_offset(self):
         x = sympy_index_symbol("x")
