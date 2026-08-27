@@ -69,6 +69,7 @@ from torch.torch_version import __version__ as __version__
 if TYPE_CHECKING:
     import sympy
 
+    from torch._inductor.compile_option_registry import CompileOptionRoute
     from torch.distributed._local_tensor import LocalIntNode
     from torch.fx.experimental._constant_symnode import ConstantIntNode
     from torch.fx.experimental.dynamic_spec import ParamsSpec, ShapesSpec
@@ -2829,6 +2830,9 @@ class _TorchCompileInductorWrapper:
         from torch._inductor.compiler_bisector import CompilerBisector
 
         self.config: dict[str, _Any] = {}
+        # names in self.config routed to a backend-owned ConfigModule via
+        # torch._inductor.compile_option_registry, keyed like self.config
+        self._config_routes: dict[str, CompileOptionRoute] = {}
         self.dynamic = dynamic
         self.name = name
         self.apply_mode(mode)
@@ -2871,27 +2875,41 @@ class _TorchCompileInductorWrapper:
             return
 
         from torch._inductor import config
+        from torch._inductor.compile_option_registry import (
+            get_compile_option_route,
+            resolve_config_module,
+        )
 
         current_config: dict[str, _Any] = config.get_config_copy()
 
         for key, val in options.items():
             attr_name = key.replace("-", "_")
-            if attr_name not in current_config:
-                raise RuntimeError(
-                    f"Unexpected optimization option {key}, known options are {list(current_config.keys())}"
-                )
-            attr_type = config.get_type(attr_name)  # type: ignore[attr-defined]
+            route = get_compile_option_route(attr_name)
+            if route is None:
+                if attr_name not in current_config:
+                    raise RuntimeError(
+                        f"Unexpected optimization option {key}, known options are {list(current_config.keys())}"
+                    )
+                owner_config = config
+                target_key = attr_name
+            else:
+                owner_config = resolve_config_module(route)
+                target_key = route.key
+            attr_type = owner_config.get_type(target_key)  # type: ignore[attr-defined]
             # Subscriptable generic types don't support isinstance so skip the type
             # check. There doesn't seem to be a good way of checking membership without
             # 3rd party libraries.
             if _get_origin(attr_type) is None:
                 if not isinstance(val, attr_type):
                     val_type_str = type(val).__name__
-                    expected_type_str = type(current_config[attr_name]).__name__
+                    expected = owner_config.get_config_copy()[target_key]
+                    expected_type_str = type(expected).__name__
                     raise RuntimeError(
                         f"Unexpected type of attr {key}, got {val_type_str} should be {expected_type_str}"
                     )
             self.config[attr_name] = val
+            if route is not None:
+                self._config_routes[attr_name] = route
 
     def __call__(
         self,
@@ -2901,19 +2919,29 @@ class _TorchCompileInductorWrapper:
         config_patches: dict[str, _Any] | None = None,
     ) -> _Any:
         from torch._inductor.compile_fx import compile_fx
+        from torch._inductor.compile_option_registry import get_compile_option_route
 
         all_patches = {**self.config, **(config_patches or {})}
+        all_routes = dict(self._config_routes)
+        for key in all_patches:
+            if key not in all_routes:
+                route = get_compile_option_route(key)
+                if route is not None:
+                    all_routes[key] = route
         return compile_fx(
             model_,
             inputs_,
             config_patches=all_patches,
+            config_patch_routes=all_routes or None,
             compile_region_name=self.name,
         )
 
     def get_compiler_config(self) -> dict[str, _Any]:
         from torch._inductor.compile_fx import get_patched_config_dict
 
-        return get_patched_config_dict(config_patches=self.config)
+        return get_patched_config_dict(
+            config_patches=self.config, config_patch_routes=self._config_routes
+        )
 
     def reset(self) -> None:
         from torch._inductor import config

@@ -30,6 +30,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from . import config
 from .compile_fx import _CompileFxKwargs, _InProcessFxCompile, FxCompile, log
+from .compile_option_registry import patch_routed_configs, snapshot_routed_configs
 from .debug import DebugContext
 from .graph import GraphLowering
 from .virtualized import V
@@ -216,6 +217,9 @@ class _WireProtocolInput:
     graph_kwargs: _CompileFxKwargs
     tracing_context: torch._guards.TracingContext | None
     config: dict[str, object]
+    # snapshot_routed_configs() of the compile-option registry, replayed in the
+    # child so routed backend options keep their values there
+    routed_configs: dict[str, dict[str, object]]
     virtualized: _VirtualizedSerializer
     deterministic_guard_for_testing: (  # type: ignore[name-defined]  # mypy bug
         torch.testing._internal.common_utils.DeterministicGuard | None
@@ -521,6 +525,7 @@ class _SerializedFxCompile(FxCompile):
                 graph_kwargs,
                 context,
                 config.save_config_portable(),
+                snapshot_routed_configs(),
                 _VirtualizedSerializer.serialize(),
                 deterministic_guard_for_testing,
                 logger_state,
@@ -571,6 +576,7 @@ class _SerializedFxCompile(FxCompile):
             stack.enter_context(input.virtualized.patch())
             stack.enter_context(input.lowering.patch())
             stack.enter_context(config.patch(input.config))
+            stack.enter_context(patch_routed_configs(input.routed_configs))
             captured_logs = stack.enter_context(input.logger_state)
             if input.deterministic_guard_for_testing:
                 stack.enter_context(input.deterministic_guard_for_testing)

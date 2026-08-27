@@ -116,6 +116,11 @@ from ..fx.graph import _PyTreeCodeGen
 from ..utils._triton import has_triton
 from . import config, distributed_autotune, metrics
 from .codegen.common import get_wrapper_codegen_for_device, init_backend_registration
+from .compile_option_registry import (
+    CompileOptionRoute,
+    import_config_module,
+    patch_compile_options,
+)
 from .debug import DebugContext
 from .decomposition import select_decomp_table
 from .exc import InductorError
@@ -976,10 +981,15 @@ def fake_tensor_prop(
 
 # pass config dict back to user
 def get_patched_config_dict(
-    config_patches: str | dict[str, Any] | None = None,
+    config_patches: dict[str, Any] | None = None,
+    config_patch_routes: dict[str, CompileOptionRoute] | None = None,
 ) -> dict[str, Any]:
-    with config.patch(config_patches):
-        return config.get_config_copy()
+    with patch_compile_options(config_patches, config_patch_routes):
+        config_copy = config.get_config_copy()
+        for name, route in (config_patch_routes or {}).items():
+            owner_config = import_config_module(route.module)
+            config_copy[name] = owner_config.get_config_copy()[route.key]
+        return config_copy
 
 
 @contextlib.contextmanager
@@ -3086,6 +3096,7 @@ def compile_fx(
     example_inputs_: Sequence[InputType],
     inner_compile: Callable[..., OutputCode] = compile_fx_inner,
     config_patches: dict[str, Any] | None = None,
+    config_patch_routes: dict[str, CompileOptionRoute] | None = None,
     decompositions: dict[OpOverload, Callable[..., Any]] | None = None,
     ignore_shape_env: bool = False,
     compile_region_name: str | None = None,
@@ -3097,6 +3108,11 @@ def compile_fx(
     ``inner_compile`` to perform actual compilation.  In other words, this
     function orchestrates end-to-end compilation for the inductor backend when
     you use :func:`torch.compile`.
+
+    ``config_patch_routes`` maps names in ``config_patches`` registered via
+    ``torch._inductor.compile_option_registry`` to their owning ConfigModule;
+    those entries are patched onto the owner module instead of
+    ``torch._inductor.config``.
 
     NB: This function TAKES OWNERSHIP of the input ``model_`` and can potentially
     mutate it!  Make a copy if you need to preserve the original GraphModule.
@@ -3118,12 +3134,14 @@ def compile_fx(
         return model_
 
     if config_patches:
-        with config.patch(config_patches):
+        with patch_compile_options(config_patches, config_patch_routes):
             return compile_fx(
                 model_,
                 example_inputs_,
                 # need extra layer of patching as backwards is compiled out of scope
-                inner_compile=config.patch(config_patches)(inner_compile),
+                inner_compile=patch_compile_options(
+                    config_patches, config_patch_routes
+                )(inner_compile),
                 decompositions=decompositions,
                 ignore_shape_env=ignore_shape_env,
                 compile_region_name=compile_region_name,
