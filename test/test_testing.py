@@ -21,12 +21,12 @@ import torch
 
 from torch.testing import make_tensor
 from torch.testing._internal.common_utils import (
-    IS_FBCODE, IS_JETSON, IS_MACOS, IS_SANDCASTLE, IS_WINDOWS, TestCase, run_tests, slowTest,
+    IS_CI, IS_FBCODE, IS_JETSON, IS_MACOS, IS_SANDCASTLE, IS_WINDOWS, TestCase, run_tests, slowTest,
     parametrize, reparametrize, subtest, instantiate_parametrized_tests, dtype_name,
     TEST_WITH_PERIODIC, TEST_WITH_ROCM, decorateIf, periodic, skipIfTorchDynamo, skipIfXpu,
     TemporaryFileName,
 )
-from torch.testing._internal.common_cuda import has_device_side_assert
+from torch.testing._internal.common_cuda import has_device_side_assert, TEST_CUDA
 from torch.testing._internal.common_device_type import \
     (PYTORCH_TESTING_DEVICE_EXCEPT_FOR_KEY, PYTORCH_TESTING_DEVICE_ONLY_FOR_KEY, dtypes,
      get_device_type_test_bases, instantiate_device_type_tests, onlyCPU, onlyCUDA, onlyNativeDeviceTypes,
@@ -762,6 +762,7 @@ if __name__ == "__main__":
         self.assertNotIn("periodic", plain_marks)
 
     @periodic
+    @unittest.skipIf(IS_CI and TEST_CUDA, "CPU-only test, skip on GPU runners")
     def test_periodic_smoke(self):
         self.assertTrue(TEST_WITH_PERIODIC)
 
