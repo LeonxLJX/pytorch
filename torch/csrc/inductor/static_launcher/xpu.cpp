@@ -21,7 +21,6 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/csrc/inductor/static_launcher/xpu.h>
 #include <cstdint>
-#include <stdexcept>
 
 #include <level_zero/ze_api.h>
 #include <sycl/sycl.hpp>
@@ -32,7 +31,7 @@
     if (status != ZE_RESULT_SUCCESS) {                                    \
       std::stringstream ss;                                               \
       ss << "L0 runtime error: " << std::hex << std::uppercase << status; \
-      throw std::runtime_error(std::move(ss).str());                      \
+      TORCH_CHECK(false, std::move(ss).str());                            \
     }                                                                     \
   }
 
