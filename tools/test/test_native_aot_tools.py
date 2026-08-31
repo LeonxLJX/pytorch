@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import io
 import json
 import os
 import sys
@@ -588,43 +589,59 @@ class TestArch(unittest.TestCase):
         # malformed, +PTX and non-exportable entries drop out.
         f = export.archs_from_cuda_arch_list
         self.assertEqual(f("7.5 8.9"), [])
-        self.assertEqual(f("9.0a;10.0a"), ["sm_100a"])
-        self.assertEqual(f("8.0 9.0 10.0+PTX"), ["sm_100"])
+        # Hopper and Blackwell together: one tree per arch, selected at
+        # runtime by capability.
+        self.assertEqual(f("9.0a;10.0a"), ["sm_90a", "sm_100a"])
+        self.assertEqual(f("8.0 9.0 10.0+PTX"), ["sm_90", "sm_100"])
         # Both spellings of a CC are separate nvcc targets, and both are
         # exportable: CI passes "10.0a", the wheel builds pass "10.0".
         self.assertEqual(f("10.0"), ["sm_100"])
-        # 10.3 is not exportable while the runtime gate is major-only.
+        # 10.3 stays unexportable -- nothing names it, so shipping it would
+        # only grow wheels (the gate itself is major.minor and would be safe).
         self.assertEqual(f("Hopper 10.3a"), [])
 
     def test_archs_from_cuda_arch_list_dedups(self):
-        # "10.0;10.0+PTX" names one arch twice. Without dedup the result
-        # reads as multi-arch downstream: nested <out>/<arch>/ layout the
-        # one-level CMake globs do not walk, and a --jobs 1 hard exit.
+        # "10.0;10.0+PTX" names one arch twice; a repeated entry would read as
+        # multi-arch downstream and export a second full set of kernels.
         f = export.archs_from_cuda_arch_list
         self.assertEqual(f("10.0;10.0+PTX"), ["sm_100"])
         self.assertEqual(f("10.0a 10.0a"), ["sm_100a"])
-        # Distinct spellings are distinct targets, so both survive.
-        self.assertEqual(f("10.0;10.0a"), ["sm_100", "sm_100a"])
+
+    def test_the_shipped_arches_are_ones_the_tooling_can_target(self):
+        # The two sets live beside each other so they cannot drift; the import-time
+        # check is what makes that true rather than merely intended.
+        self.assertLessEqual(
+            set(native_aot_decl.EXPORTABLE_ARCHES), set(native_aot_decl.KNOWN_ARCHES)
+        )
+        # ...and the exporter's name is the same object, not a copy that could age.
+        self.assertIs(export.EXPORTABLE_ARCHES, native_aot_decl.EXPORTABLE_ARCHES)
+
+    def test_archs_from_cuda_arch_list_collapses_one_capability(self):
+        # Both spellings of a capability are the same hardware, and generation
+        # can only use one of them (_by_arch prefers the arch-conditional
+        # build). Exporting both compiles a second full set of kernels whose
+        # objects then ship inside libtorch_cuda with no launcher referencing
+        # them. CUDA 13.x manywheel lists reach this, so it is the common case.
+        f = export.archs_from_cuda_arch_list
+        self.assertEqual(f("10.0;10.0a"), ["sm_100a"])
+        self.assertEqual(f("10.0a;10.0"), ["sm_100a"])
+        # Different capabilities are untouched, and order is preserved.
+        self.assertEqual(f("9.0a;10.0;10.0a"), ["sm_90a", "sm_100a"])
+        self.assertEqual(f("10.0a;9.0"), ["sm_100a", "sm_90"])
 
     def test_collect_jobs_respects_declaration_archs(self):
         # A declaration pinning ARCHS gets no jobs for other arches; an
         # on-device export (arch None) is never filtered.
-        import tempfile
-        import unittest.mock as mock
-
-        decl_body = (
-            'ATEN_OP = "fakeop"\nDISPATCH_KEY = "CUDA"\n'
-            'KERNEL_MODULE = "k.py"\nARCHS = ("sm_100a",)\n'
-            "def kernel_precompile_grid():\n    return [{'dtype': 'float32'}]\n"
-            "def covered_axes(self):\n    return {}\n"
-            "def cpp_dispatch(spec):\n    return 'true'\n"
-            "def cpp_launch(spec, launch_fn):\n    return launch_fn\n"
-        )
         with tempfile.TemporaryDirectory() as ops, tempfile.TemporaryDirectory() as out:
-            os.makedirs(os.path.join(ops, "fakeop"))
-            with open(os.path.join(ops, "fakeop", "aot.py"), "w") as f:
-                f.write(decl_body)
-            with mock.patch.object(export, "OPS_DIR", ops):
+            _write_fake_decl(ops, 'ARCHS = ("sm_100a",)\n')
+            # _detected_arch patched: the on-device call below resolves the
+            # directory from it, and an unpatched run would pass only on a
+            # machine with a GPU -- this suite must also pass in the linter
+            # image, which has no built torch at all.
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device="sm_100a"),
+            ):
                 blackwell = export._collect_jobs(None, out, ["sm_100a"])
                 hopper = export._collect_jobs(None, out, ["sm_90a"])
                 on_device = export._collect_jobs(None, out, [None])
@@ -633,64 +650,39 @@ class TestArch(unittest.TestCase):
         self.assertEqual(len(on_device), 1)
 
     def test_multi_arch_jobs_nest_per_arch(self):
-        # Multi-arch fan-out nests <out>/<arch>/<decl_id>; single arch
-        # (or default None) keeps the flat layout.
-        import tempfile
-        import unittest.mock as mock
-
+        # Every job nests under <out>/<arch>/<decl_id>, one arch or several:
+        # adding an arch to an op is then just another directory. There is no
+        # second (flat) layout -- the assertions below pin that for the
+        # single-arch and on-device cases too.
         with tempfile.TemporaryDirectory() as ops, tempfile.TemporaryDirectory() as out:
-            os.makedirs(os.path.join(ops, "fakeop"))
-            with open(os.path.join(ops, "fakeop", "aot.py"), "w") as f:
-                f.write(
-                    'ATEN_OP = "fakeop"\nDISPATCH_KEY = "CUDA"\n'
-                    'KERNEL_MODULE = "k.py"\n'
-                    "def kernel_precompile_grid():\n    return [{'dtype': 'float32'}]\n"
-                    "def covered_axes(self):\n    return {}\n"
-                    "def cpp_dispatch(spec):\n    return 'true'\n"
-                    "def cpp_launch(spec, launch_fn):\n    return launch_fn\n"
-                )
-            with mock.patch.object(export, "OPS_DIR", ops):
+            _write_fake_decl(ops)
+            # _detected_arch patched, not read from the runner: the layout must
+            # be the same shape everywhere, and an unpatched call would make
+            # this test depend on whether the machine has a GPU.
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                # Device-only resolution: an ambient CUTE_DSL_ARCH would outrank
+                # it and put the on-device job in a different arch directory.
+                _no_ambient_arch(device="sm_100"),
+            ):
                 multi = export._collect_jobs(None, out, ["sm_90a", "sm_100a"])
                 single = export._collect_jobs(None, out, [None])
         self.assertEqual(len(multi), 2)
         dirs = sorted(os.path.basename(os.path.dirname(j[3])) for j in multi)
         self.assertEqual(dirs, ["sm_100a", "sm_90a"])
         self.assertEqual({j[4] for j in multi}, {"sm_90a", "sm_100a"})
+        # ONE layout: a single arch nests under its own directory too, so
+        # adding an arch to an op is just another directory.
         (sj,) = single
         self.assertEqual(os.path.basename(sj[3]), "fakeop")
-        self.assertIsNone(sj[4])
-
-    def test_empty_dir_is_fine(self):
-        # A clean build (or a newly added spec point) has no sidecar and
-        # no artifacts; it must export, not fail.
-        with tempfile.TemporaryDirectory() as d:
-            export._check_no_orphan_artifacts(d)
-
-    def test_artifacts_without_sidecar_are_fatal(self):
-        # An export that died between compiling and writing the sidecar.
-        # The CMake globs link *.o by pattern, so an undescribed orphan
-        # would otherwise be linked silently.
-        with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "k_f32.o"), "w").close()
-            with self.assertRaisesRegex(RuntimeError, "no sidecar"):
-                export._check_no_orphan_artifacts(d)
-
-    def test_artifacts_with_sidecar_are_fine(self):
-        with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "k.o"), "w").close()
-            with open(os.path.join(d, "k.json"), "w") as f:
-                json.dump({"prefix": "k"}, f)
-            export._check_no_orphan_artifacts(d)
-
-    def test_unreadable_sidecar_is_fatal(self):
-        # Present but unparsable: corruption, not an interrupted run.
-        # Re-exporting would paper over it (and --force skips the check).
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "k.json")
-            with open(path, "w") as f:
-                f.write("{truncated")
-            with self.assertRaisesRegex(RuntimeError, "could not be read"):
-                export._read_sidecar(path)
+        # sm_100a, not the detected sm_100: an on-device export adopts the
+        # spelling the DECLARATION claims, as the generator's tie-break does. So
+        # the tree cannot be one the declaration disowns -- a declaration pinning
+        # ("sm_100a",) got an sm_100 tree, and generation's "delete and re-export"
+        # remedy rebuilt the identical one -- and the job carries that arch
+        # explicitly, so kernels match what is recorded.
+        self.assertEqual(os.path.basename(os.path.dirname(sj[3])), "sm_100a")
+        self.assertEqual(sj[4], "sm_100a")
 
     def test_cross_product(self):
         pts = export.expand_specs(
@@ -744,6 +736,104 @@ class TestLauncherCodegen(unittest.TestCase):
     def test_module_load_is_once_per_process(self):
         src = self._launcher()
         self.assertIn("c10::call_once", src)
+
+
+class TestSidecarIntegrity(unittest.TestCase):
+    """The sidecar is written after the artifacts, so it is the commit
+    marker: absent means not-yet-exported, corrupt or orphaned means the
+    tree cannot be trusted."""
+
+    def test_empty_dir_is_fine(self):
+        # A clean build (or a newly added spec point) has no sidecar and
+        # no artifacts; it must export, not fail.
+        with tempfile.TemporaryDirectory() as d:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                export._check_no_orphan_artifacts(d, [])
+        self.assertEqual(out.getvalue(), "", "a clean directory says nothing")
+
+    def test_artifacts_without_a_sidecar_are_reported_not_fatal(self):
+        # An export that died between compiling and writing the sidecar. Generation
+        # names artifacts from sidecars and there is no glob anywhere in the link
+        # path, so an undescribed orphan is disk rather than payload; refusing it
+        # only forced a hand-delete.
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "k_f32.o"), "w").close()
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                export._check_no_orphan_artifacts(d, [])
+        self.assertIn("no sidecar claims", out.getvalue())
+        self.assertIn("k_f32.o", out.getvalue())
+
+    def test_an_orphan_beside_a_committed_point_is_reported_not_fatal(self):
+        # Where an interrupt actually lands: among points that already committed.
+        # Keyed per DIRECTORY the check saw a sidecar and asked nothing further, so
+        # this pair survived every later export unreported. Keyed per artifact and
+        # FATAL it went too far the other way: the DSL writes the .h before the .o, so
+        # a single failed compile in a 48-point grid made every later export refuse the
+        # directory -- including --force, which is read after this scan.
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("k_n1.o", "k_n1.h", "k_n2.h"):
+                open(os.path.join(d, name), "w").close()
+            with open(os.path.join(d, "k_n1.json"), "w") as f:
+                # version, so the stale half runs rather than short-circuiting.
+                json.dump(
+                    {
+                        "version": export.SIDECAR_VERSION,
+                        "prefix": "k_n1",
+                        "kind": "cutedsl",
+                        "spec": {"N": 1},
+                    },
+                    f,
+                )
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                export._check_no_orphan_artifacts(d, [{"N": 1}, {"N": 2}])
+        self.assertIn("k_n2.h", out.getvalue())
+        self.assertIn("no sidecar claims", out.getvalue())
+
+    def test_a_fresh_trees_failed_first_export_is_not_called_corruption(self):
+        # Nothing committed is what the FIRST export of an arch looks like when it
+        # dies: the DSL writes the .h before the .o, so a failed compile strands one
+        # per point and no sidecar exists yet. Diagnosing that as "a partial copy or
+        # a hand-edited export" was both wrong and fatal, and --force could not
+        # clear it -- this scan runs before that flag is read.
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("k_n1.o", "k_n1.h"):
+                open(os.path.join(d, name), "w").close()
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                export._check_no_orphan_artifacts(d, [{"N": 1}])
+        self.assertIn("no sidecar claims", out.getvalue())
+        self.assertNotIn("partial copy", out.getvalue())
+
+    def test_artifacts_with_sidecar_are_fine(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "k.o"), "w").close()
+            with open(os.path.join(d, "k.json"), "w") as f:
+                # version, or the stale half short-circuits at the schema gate and
+                # the spec comparison below never runs.
+                json.dump(
+                    {
+                        "version": export.SIDECAR_VERSION,
+                        "prefix": "k",
+                        "kind": "cutedsl",
+                        "spec": {"N": 1},
+                    },
+                    f,
+                )
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                export._check_no_orphan_artifacts(d, [{"N": 1}])
+        # SILENT, not merely non-fatal: claiming per ARTIFACT is what stops a healthy
+        # directory reporting its own kernels, and asserting "does not raise" left
+        # that unpinned -- reporting every artifact as an orphan passed.
+        self.assertEqual(out.getvalue(), "")
+
+    def test_unreadable_sidecar_is_fatal(self):
+        # Present but unparsable: corruption, not an interrupted run.
+        # Re-exporting would paper over it (and --force skips the check).
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "k.json")
+            with open(path, "w") as f:
+                f.write("{truncated")
+            with self.assertRaisesRegex(RuntimeError, "could not be read"):
+                export._read_sidecar(path)
 
 
 # mX with one size and one stride slot, and with none at all: the two claims the
@@ -1425,21 +1515,51 @@ class TestStaleGridPointArtifacts(unittest.TestCase):
         # launcher referencing it.
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(os.path.join(tmpdir, "gone.json"), "w") as f:
-                json.dump({"prefix": "gone", "spec": {"N": 4096}}, f)
+                # version, because a real sidecar always has one: the check reads
+                # the schema first, so a version-less fixture is "unreadable", not
+                # "stale", and would test nothing.
+                json.dump(
+                    {
+                        "version": export.SIDECAR_VERSION,
+                        "prefix": "gone",
+                        "spec": {"N": 4096},
+                    },
+                    f,
+                )
             with self.assertRaisesRegex(RuntimeError, "no longer in the grid"):
                 export._check_no_orphan_artifacts(tmpdir, [{"N": 1024}])
+
+    def test_a_sidecar_from_another_schema_is_not_called_stale(self):
+        # It cannot be read, so it cannot be judged: the next SIDECAR_VERSION bump
+        # would otherwise make the first export in an existing tree demand
+        # `rm -rf` instead of re-exporting the points it no longer understands.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "old.json"), "w") as f:
+                json.dump(
+                    {
+                        "version": export.SIDECAR_VERSION + 1,
+                        "prefix": "old",
+                        "spec": {"N": 4096},
+                    },
+                    f,
+                )
+            export._check_no_orphan_artifacts(tmpdir, [{"N": 1024}])
 
     def test_sidecar_still_in_grid_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(os.path.join(tmpdir, "live.json"), "w") as f:
-                json.dump({"prefix": "live", "spec": {"N": 1024}}, f)
+                # version, for the reason the sibling test above gives: without it
+                # this fixture is "unreadable" rather than "in the grid", the spec
+                # comparison never runs, and declaring EVERY sidecar stale passed.
+                json.dump(
+                    {
+                        "version": export.SIDECAR_VERSION,
+                        "prefix": "live",
+                        "spec": {"N": 1024},
+                    },
+                    f,
+                )
             export._check_no_orphan_artifacts(tmpdir, [{"N": 1024}])
-
-    def test_grid_unknown_skips_the_stale_check(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with open(os.path.join(tmpdir, "live.json"), "w") as f:
-                json.dump({"prefix": "live", "spec": {"N": 1024}}, f)
-            export._check_no_orphan_artifacts(tmpdir)
 
 
 class TestRegistryConsistency(unittest.TestCase):
@@ -1481,6 +1601,25 @@ class TestRegistryConsistency(unittest.TestCase):
         # The import-time call, re-run explicitly so this is a test rather than a
         # side effect of collection.
         toolchains._assert_link_exts_are_exportable(toolchains.TOOLCHAINS)
+
+
+class TestClaimedSpellingPreference(unittest.TestCase):
+    def test_the_conditional_spelling_wins_when_both_are_claimed(self):
+        # Alphabetical order would pick sm_100 over sm_100a. The conditional one
+        # is what the generator's tie-break keeps for a capability, so exporting
+        # the plain build would pay a compile and then lose that tie-break.
+        both = ("sm_100", "sm_100a", "sm_90", "sm_90a")
+        self.assertEqual(export._claimed_spelling("sm_100", both), "sm_100a")
+        self.assertEqual(export._claimed_spelling("sm_100a", both), "sm_100a")
+        self.assertEqual(export._claimed_spelling("sm_90", both), "sm_90a")
+
+    def test_a_capability_that_is_not_claimed_has_no_spelling(self):
+        self.assertIsNone(export._claimed_spelling("sm_103", ("sm_100a",)))
+
+    def test_the_plain_spelling_is_used_when_it_is_the_only_claim(self):
+        # A declaration pinning the plain build must not be handed a conditional
+        # target its kernels were not written for.
+        self.assertEqual(export._claimed_spelling("sm_100a", ("sm_100",)), "sm_100")
 
 
 class TestSidecarSchemaIsReadFirst(unittest.TestCase):
@@ -1571,6 +1710,288 @@ class TestSourceClosureCoversVendoredKernels(unittest.TestCase):
             self.assertIn(rel, closure)
             # ...and the recorded hash is the file's, so an edit invalidates it.
             self.assertEqual(closure[rel], export._file_hash(path))
+
+
+class TestExportMain(unittest.TestCase):
+    """export.main() had no coverage at all, including the TORCH_CUDA_ARCH_LIST
+    translation that another comment in the same file depends on: _CLOSURE_EXCLUDED
+    justifies keeping build_stage2.py out of the source closure on the grounds
+    that "export.py reads the arch list itself, so the driver passes it nothing
+    kernel-affecting"."""
+
+    def _main(self, argv, env, jobs_seen):
+        with (
+            tempfile.TemporaryDirectory() as out,
+            mock.patch.dict(os.environ, env, clear=False),
+            mock.patch.object(
+                export,
+                "_collect_jobs",
+                lambda ops, root, archs: jobs_seen.append(archs) or [],
+            ),
+        ):
+            export.main([*argv, "--out-dir", out])
+
+    def test_the_arch_list_is_translated_into_arches(self):
+        seen = []
+        self._main([], {"TORCH_CUDA_ARCH_LIST": "9.0a;10.0a"}, seen)
+        self.assertEqual(seen, [["sm_90a", "sm_100a"]])
+
+    def test_an_explicit_arch_wins_over_the_arch_list(self):
+        seen = []
+        self._main(["--arch", "sm_90a"], {"TORCH_CUDA_ARCH_LIST": "10.0a"}, seen)
+        self.assertEqual(seen, [["sm_90a"]])
+
+    def test_no_arch_list_means_on_device(self):
+        # archs [None] is what makes _collect_jobs resolve from the device.
+        seen = []
+        self._main([], {"TORCH_CUDA_ARCH_LIST": ""}, seen)
+        self.assertEqual(seen, [[None]])
+
+    def test_an_arch_list_with_no_exportable_arch_exports_nothing(self):
+        # Not an error: a CUDA build for Ampere alone simply has no AOT kernels.
+        seen = []
+        self._main([], {"TORCH_CUDA_ARCH_LIST": "8.0;8.6"}, seen)
+        self.assertEqual(seen, [], "_collect_jobs should not even be reached")
+
+
+class TestCollectJobsRefusals(unittest.TestCase):
+    def test_an_unknown_arch_is_refused_before_the_ops_walk(self):
+        # THE case the old placement could not reach: with no declaration on disk
+        # the per-declaration walk never ran, so `--arch sm100a` matched nothing and
+        # exited 0. That is the state of this tree until a declaration lands, and it
+        # is what a --ops typo looks like forever.
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            with mock.patch.object(export, "OPS_DIR", ops):
+                self.assertEqual(os.listdir(ops), [], "no declaration on disk")
+                for bad in ("sm100a", "SM_100", "sm_1000", "sm_86", "90"):
+                    with self.subTest(arch=bad):
+                        with self.assertRaisesRegex(RuntimeError, "not an arch"):
+                            export.main(["--arch", bad, "--out-dir", out])
+                # ...and a known arch gets past the check (it exports nothing here,
+                # which is the honest answer for a tree with no declarations).
+                export.main(["--arch", "sm_100a", "--out-dir", out])
+
+    def test_an_unnameable_arch_is_refused(self):
+        # There is no unnamed layout: an artifact whose arch nobody can state is
+        # one the runtime gate cannot match to hardware. Untested before --
+        # replacing the raise with a placeholder left the suite green, because both
+        # existing _collect_jobs tests patch _detected_arch to a real sm string.
+        with tempfile.TemporaryDirectory() as ops, tempfile.TemporaryDirectory() as out:
+            _write_fake_decl(ops)
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device=None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "cannot determine the arch"):
+                    export._collect_jobs(None, out, [None])
+
+    def test_a_malformed_arch_is_refused(self):
+        # The explicit path compares ARCHS by STRING, and routing every arch
+        # through _claimed_spelling used to be the only thing that ever validated
+        # an sm string. Without cc_of here, `--arch sm100a` (or sm_1000, SM_100)
+        # matched no declaration, exported nothing, and exited 0 -- a typo that
+        # looked like a successful build. `gen_aot_lib.py`'s own stale-artifact
+        # advice tells users to run export with --arch, so this is a live path.
+        for bad in ("sm100a", "SM_100", "sm_1000", "sm_9", "90", "sm_100+PTX"):
+            with self.subTest(arch=bad):
+                with (
+                    tempfile.TemporaryDirectory() as ops,
+                    tempfile.TemporaryDirectory() as out,
+                ):
+                    _write_fake_decl(ops)
+                    with (
+                        mock.patch.object(export, "OPS_DIR", ops),
+                        _no_ambient_arch(device=None),
+                    ):
+                        # The exact refusal: "compute capability" alone also
+                        # matches cc_of's range error and any other refusal in this
+                        # function that mentions the phrase.
+                        with self.assertRaisesRegex(
+                            RuntimeError, "cannot read a compute capability"
+                        ):
+                            export._collect_jobs(None, out, [bad])
+
+    def test_a_declaration_that_ships_nothing_says_so(self):
+        # ARCHS spelling is load-bearing on the explicit path: a declaration
+        # pinning ('sm_100a',) ships nothing for a release list of plain spellings
+        # ("10.0"), and with several declarations that is PARTIAL -- the build
+        # embeds the ops that matched, relinks, passes its post-relink check, and
+        # the others are simply absent. Nothing downstream can report it, because
+        # there is no tree for generation to complain about.
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            _write_fake_decl(ops, "ARCHS = ('sm_100a',)\n")
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device=None),
+                contextlib.redirect_stdout(io.StringIO()) as printed,
+            ):
+                jobs = export._collect_jobs(None, out, ["sm_100"])
+        self.assertEqual(jobs, [])
+        said = printed.getvalue()
+        self.assertIn("declares kernels but none for this build", said)
+        self.assertIn("sm_100", said)
+        # The report is the ONLY thing that surfaces this, so it has to state the
+        # declaration's real ARCHS: it used to end with a fixed illustration, which
+        # read "an ARCHS of ('sm_100a',)" for declarations claiming something else.
+        self.assertIn("ARCHS (sm_100a)", said)
+
+    def test_a_declaration_that_misses_one_requested_arch_says_so(self):
+        # The whole-declaration report is suppressed once a declaration ships for
+        # ANY requested arch, which hid the case with the worst outcome: the matched
+        # arches embed, generation is happy, the post-relink check passes, and every
+        # device of the missed capability falls back to aten with nothing in the log.
+        # Reported per arch here, because the declaration DOES claim this capability
+        # -- under the other spelling.
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            _write_fake_decl(ops, "ARCHS = ('sm_90a', 'sm_100a')\n")
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device=None),
+                contextlib.redirect_stdout(io.StringIO()) as printed,
+            ):
+                jobs = export._collect_jobs(None, out, ["sm_90a", "sm_100"])
+        self.assertEqual(len(jobs), 1, "the arch that DID match must still export")
+        said = printed.getvalue()
+        self.assertIn("requested sm_100", said)
+        self.assertIn("only as sm_100a", said)
+
+    def test_an_arch_the_declaration_does_not_target_stays_quiet(self):
+        # The other half: a capability the declaration claims under NO spelling is
+        # not news, or every partial build reports every op. Suppressed only because
+        # this declaration ships for the arch that did match.
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            _write_fake_decl(ops, "ARCHS = ('sm_90a',)\n")
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device=None),
+                contextlib.redirect_stdout(io.StringIO()) as printed,
+            ):
+                jobs = export._collect_jobs(None, out, ["sm_90a", "sm_100"])
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(printed.getvalue(), "")
+
+    def test_an_on_device_export_that_ships_nothing_says_so(self):
+        # The explicit path reported this and the automatic path did not, for a
+        # request that means the same thing ("export for this machine"), so the user
+        # saw only `exported 0 kernels` -- no op named, no ARCHS, nothing to act on.
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            _write_fake_decl(ops, "ARCHS = ('sm_100a',)\n")
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device="sm_90"),
+                contextlib.redirect_stdout(io.StringIO()) as printed,
+            ):
+                jobs = export._collect_jobs(None, out, [None])
+        self.assertEqual(jobs, [])
+        said = printed.getvalue()
+        self.assertIn("declares kernels but none for this build", said)
+        self.assertIn("sm_90", said)
+
+    def test_a_declaration_that_does_ship_is_not_reported(self):
+        # The control: the report must not fire for the ordinary case, or it is
+        # noise on every build.
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            _write_fake_decl(ops, "ARCHS = ('sm_100', 'sm_100a')\n")
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device=None),
+                contextlib.redirect_stdout(io.StringIO()) as printed,
+            ):
+                jobs = export._collect_jobs(None, out, ["sm_100"])
+        self.assertTrue(jobs)
+        self.assertNotIn("declares kernels but none", printed.getvalue())
+
+    def test_a_declaration_that_disowns_the_local_capability_is_skipped(self):
+        # Skipped, not exported into a tree the declaration disowns: that tree made
+        # generation refuse with "delete and re-export", whose remedy rebuilt the
+        # identical tree, so `pip install -e .` failed permanently.
+        with tempfile.TemporaryDirectory() as ops, tempfile.TemporaryDirectory() as out:
+            _write_fake_decl(ops, "ARCHS = ('sm_90a',)\n")
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device="sm_100"),
+            ):
+                self.assertEqual(export._collect_jobs(None, out, [None]), [])
+                self.assertEqual(os.listdir(out), [], "no tree for a disowned arch")
+
+    def test_the_declarations_spelling_is_adopted_for_the_local_capability(self):
+        # sm_100 detected, ('sm_100a',) claimed: same capability, so the job is
+        # created and BOTH the tree and the compile target use the declaration's
+        # spelling. Preferring the conditional one matches the generator's
+        # tie-break, which drops the plain build for the same capability anyway.
+        with tempfile.TemporaryDirectory() as ops, tempfile.TemporaryDirectory() as out:
+            _write_fake_decl(ops, "ARCHS = ('sm_100a',)\n")
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device="sm_100"),
+            ):
+                (job,) = export._collect_jobs(None, out, [None])
+        self.assertEqual(os.path.basename(os.path.dirname(job[3])), "sm_100a")
+        self.assertEqual(job[4], "sm_100a")
+
+
+class TestOrphanCheckIsCalled(unittest.TestCase):
+    def test_collect_jobs_runs_the_orphan_check(self):
+        # Every orphan test calls _check_no_orphan_artifacts DIRECTLY, so deleting
+        # its only production call site left the suite green -- the same
+        # missing-call-site shape already fixed for validate_abi and _write_atomic.
+        # An undescribed .o would then be linked with no launcher referencing it.
+        seen = []
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            _write_fake_decl(ops)
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                mock.patch.object(
+                    export,
+                    "_check_no_orphan_artifacts",
+                    lambda d, points: seen.append(d),
+                ),
+                _no_ambient_arch(device="sm_100"),
+            ):
+                export._collect_jobs(None, out, [None])
+        self.assertEqual(len(seen), 1, "the orphan check must run per (decl, arch)")
+        self.assertTrue(seen[0].endswith(os.path.join("sm_100a", "fakeop")))
+
+    def test_an_undescribed_artifact_is_reported_through_the_call_site(self):
+        # End to end through the call site: the report reaches the build log, and
+        # does not stop the export -- nothing links an artifact no sidecar names.
+        with (
+            tempfile.TemporaryDirectory() as ops,
+            tempfile.TemporaryDirectory() as out,
+        ):
+            _write_fake_decl(ops)
+            stray = os.path.join(out, "sm_100a", "fakeop")
+            os.makedirs(stray)
+            open(os.path.join(stray, "leftover.o"), "w").close()
+            with (
+                mock.patch.object(export, "OPS_DIR", ops),
+                _no_ambient_arch(device="sm_100"),
+                contextlib.redirect_stdout(io.StringIO()) as said,
+            ):
+                jobs = export._collect_jobs(None, out, [None])
+        self.assertIn("leftover.o", said.getvalue())
+        self.assertTrue(jobs, "the export still runs; the orphan is only disk")
 
 
 class TestMissingArtifacts(unittest.TestCase):

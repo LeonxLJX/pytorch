@@ -10,7 +10,8 @@ those during stage 1, before torch exists).
 
 For each ``torch/_native/ops/<op>/aot.py``, expands the spec grid (list
 fields cross-multiply) and for every grid point runs the toolchain's
-compile + export into ``<out-dir>/<op>/``, writing:
+compile + export into ``<out-dir>/<arch>/<op>/`` -- one tree per arch,
+whatever the arch count -- writing:
 
     <prefix>.h / <prefix>.o    C-ABI header + kernel object
     <prefix>.json              marshalling sidecar {spec, arch, tensor_args}
@@ -42,11 +43,8 @@ driver, so kernels build on GPU-less machines. The arch is per-COMPILE
 state: CuTeDSL takes a --gpu-arch option, which outranks CUTE_DSL_ARCH
 (base_dsl/dsl.py prefers compile_options.gpu_arch over envar.arch), and
 Triton gets a fixed-target driver per export. So a single pool serves
-every (point, arch) job. A multi-arch fan-out nests each arch under
-<out-dir>/<arch>/ to keep the trees independently linkable; a single arch
-still lands flat in <out-dir>. The next commit of this stack makes that
-uniform -- until it does, two single-arch runs into one --out-dir
-accumulate both arches, where the arch-free prefix used to overwrite.
+every (point, arch) job. Every arch nests under <out-dir>/<arch>/ to
+keep each tree independently linkable.
 CuTeDSL needs one warmup compile per process for this to work; see
 tools/native_aot/cutedsl_warmup.py.
 
@@ -259,6 +257,16 @@ def _effective_arch(arch: str | None) -> str | None:
     return _detected_arch()
 
 
+def _claimed_spelling(arch: str, claimed: tuple[str, ...]) -> str | None:
+    """The spelling in ``claimed`` for ``arch``'s capability, or None.
+
+    Prefers the arch-conditional spelling when a declaration lists both, matching
+    the generator's tie-break: it is what the kernels were written against."""
+    want = decl.cc_of(arch)
+    same_cc = [a for a in claimed if decl.cc_of(a) == want]
+    return min(same_cc, key=lambda a: (not a.endswith("a"), a)) if same_cc else None
+
+
 def export_point(
     op_pkg: str, kernel_module: str, point: dict, out_dir: str, arch: str | None = None
 ) -> str:
@@ -325,13 +333,23 @@ def export_point(
 def _collect_jobs(ops_filter, out_root: str, archs):
     """(op_pkg, kernel_module, point, out_dir, arch) per spec point per
     arch across every declaration; grids expand here (cheap,
-    torch-light), skip detection is _job_needed's sidecar scan. A
-    single arch (or None = detect from the local device) keeps the flat
-    <out-root>/<decl_id>/ layout; a multi-arch fan-out nests
-    <out-root>/<arch>/<decl_id>/ so per-arch artifact trees stay
-    independently gen-able and linkable."""
+    torch-light), skip detection is _job_needed's sidecar scan.
+
+    ONE layout whatever the arch count: <out-root>/<arch>/<decl_id>/, so adding
+    an arch is another directory rather than a different shape. A per-count layout
+    left the other shape's tree behind when a build switched between one arch and
+    several, and the same arch then appeared twice for one declaration
+    (gen_aot_lib's duplicate-prefix check stays as a backstop).
+
+    The generated .cpp sits at <out-root>/<decl_id>/, covering all of them."""
     jobs = []
-    multi = len(archs) > 1
+    # Declarations that matched NO requested arch, reported at the end: an ARCHS
+    # of only conditional spellings ships nothing for a release list of plain ones,
+    # and with several declarations the result is partial but looks healthy -- the
+    # matched ops embed and pass the post-relink check while the rest are simply
+    # absent, with no tree for generation to complain about.
+    skipped: dict[str, list[str]] = {}
+    declared: dict[str, tuple[str, ...]] = {}
     for entry in sorted(os.listdir(OPS_DIR)):
         op_dir = os.path.join(OPS_DIR, entry)
         if not os.path.exists(os.path.join(op_dir, "aot.py")):
@@ -341,22 +359,82 @@ def _collect_jobs(ops_filter, out_root: str, archs):
             if ops_filter and entry not in ops_filter and d.ATEN_OP not in ops_filter:
                 continue
             for arch in archs:
-                # Declaration-level arch support: skip (declaration x
-                # arch) pairs the op's kernels are not valid on. An
-                # on-device export (arch None) is not filtered -- the
-                # builder machine is the target by construction.
-                if arch is not None and arch not in decl.archs_of(d):
-                    continue
-                # `multi` implies explicit sm strings (a [None] arch
-                # list is always length 1); the arch check narrows for
-                # the type checker.
-                root = os.path.join(out_root, arch) if multi and arch else out_root
-                out_dir = os.path.join(root, did)
+                # No unnamed layout: an artifact whose arch nobody can state
+                # cannot be matched to hardware by the runtime gate.
+                layout_arch = _effective_arch(arch)
+                if not layout_arch:
+                    raise RuntimeError(
+                        "cannot determine the arch to export for: no --arch "
+                        "given and no local GPU to detect from. Pass --arch "
+                        "(e.g. --arch sm_100a), which also lets export run on "
+                        "a machine without a GPU."
+                    )
+                # TWO paths, because this name is also what generation filters
+                # trees by (--archs, from the same list stage 2 passed here):
+                #
+                #   * an EXPLICIT arch is used verbatim, and a declaration not
+                #     claiming it is skipped. Resolving it to another spelling
+                #     named the tree something generation was never told about, so
+                #     it embedded nothing -- silently, since no sources reads as
+                #     "no declaration ships kernels". Every plain spelling in a
+                #     release arch list hit this.
+                #   * an ON-DEVICE arch adopts the spelling the declaration claims
+                #     for the detected capability, as the generator's tie-break
+                #     does. It passes no --archs, so it cannot desynchronize, and
+                #     it is the path that needed resolving: the device reports the
+                #     plain spelling, so a declaration pinning ('sm_100a',) got a
+                #     tree it disowned.
+                if arch is not None:
+                    # main() has already refused an --arch outside KNOWN_ARCHES, so
+                    # the string comparison below is against a spelling that parses.
+                    claims = decl.archs_of(d)
+                    if layout_arch not in claims:
+                        # REPORTED, not refused: the spellings are distinct nvcc
+                        # targets, so a declaration pinning one cannot serve a build
+                        # compiled for the other, and aten is the right answer there.
+                        # Per arch, because the whole-declaration misses below are
+                        # suppressed once anything ships -- which hid this case.
+                        other = _claimed_spelling(layout_arch, claims)
+                        if other:
+                            print(
+                                f"{did}: declares kernels but none for this build -- "
+                                f"requested {layout_arch}, and the declaration's "
+                                f"ARCHS ({' '.join(claims)}) names that capability "
+                                f"only as {other}, so this op falls back to aten on "
+                                f"{layout_arch} hardware. The spellings must match "
+                                f"exactly."
+                            )
+                        else:
+                            skipped.setdefault(did, []).append(layout_arch)
+                            declared[did] = claims
+                        continue
+                else:
+                    claimed = _claimed_spelling(layout_arch, decl.archs_of(d))
+                    if claimed is None:
+                        # The explicit path's miss, on the automatic path: without
+                        # this an on-device run that ships nothing for the local
+                        # device says only `exported 0 kernels`, naming no op.
+                        skipped.setdefault(did, []).append(layout_arch)
+                        declared[did] = decl.archs_of(d)
+                        continue
+                    layout_arch = claimed
+                out_dir = os.path.join(out_root, layout_arch, did)
                 os.makedirs(out_dir, exist_ok=True)
                 points = expand_specs(d.kernel_precompile_grid())
                 _check_no_orphan_artifacts(out_dir, points)
                 for point in points:
-                    jobs.append((entry, d.KERNEL_MODULE, point, out_dir, arch))
+                    # The arch is named for the COMPILE too, so artifacts are built
+                    # for what the sidecar records, not what the toolchain picks.
+                    jobs.append((entry, d.KERNEL_MODULE, point, out_dir, layout_arch))
+    shipped = {os.path.basename(j[3]) for j in jobs}
+    for did, missed in sorted(skipped.items()):
+        if did not in shipped:
+            print(
+                f"{did}: declares kernels but none for this build -- requested "
+                f"{' '.join(missed)}, and the declaration's ARCHS "
+                f"({' '.join(declared[did])}) names none of them, so this op falls back "
+                f"to aten. The spellings must match exactly."
+            )
     return jobs
 
 
@@ -391,49 +469,71 @@ def _read_sidecar(path: str) -> dict:
         ) from e
 
 
-def _check_no_orphan_artifacts(out_dir: str, specs=None) -> None:
-    """Fail if a directory holds kernel artifacts no current grid point
-    claims.
+def _check_no_orphan_artifacts(out_dir: str, specs) -> None:
+    """Report or refuse kernel artifacts no current grid point claims.
 
-    Two ways that happens. Artifacts with NO sidecar at all: the sidecar is
-    the commit marker, so they mean an interrupted or hand-edited export.
-    Artifacts whose sidecar records a spec that is no longer in the grid:
-    dropping a point from kernel_precompile_grid() generates no job for it
-    and nothing prunes it. Either way the CMake globs link *.o by pattern,
-    so the object ships with no launcher referencing it -- exactly what this
-    check exists to prevent. An EMPTY directory is fine (clean build, or a
-    new spec point).
+    Two ways that happens, and they differ in how recoverable they are.
 
-    ``specs`` is the expanded grid for this (declaration, arch); None skips
-    the stale-point half, for callers that do not have the grid in hand.
+    Artifacts NO SIDECAR CLAIMS, beside points that did commit: an export that
+    died between writing them and writing its sidecar (a Ctrl-C, an OOM-killed
+    worker, a compile failure -- the DSL writes the .h before the .o, so even the
+    last of those strands one). REPORTED, not fatal: nothing links an artifact no
+    sidecar names, so the cost is disk, and a re-export of that point overwrites
+    it. As a refusal it turned every transient failure in a 48-point grid into a
+    hand-delete of the directory, which --force could not clear either -- this scan
+    runs before that flag is read.
+
+    Reported whether or not anything else in the directory committed: keying it on
+    "did some point commit" left the FIRST export of a tree fatal, which is the
+    shape every interrupted new arch has, and diagnosed it as a partial copy.
+
+    Artifacts whose sidecar records a spec no longer in the grid: dropping a point
+    from kernel_precompile_grid() generates no job for it and nothing prunes it.
+    Fatal, because the sidecar makes it look exported.
+
+    An EMPTY directory is fine (clean build, or a new spec point).
+
+    ``specs`` is the expanded grid for this (declaration, arch).
     """
-    exts = {e for tc in toolchains.TOOLCHAINS.values() for e in tc.artifact_exts}
+    exts = toolchains.all_artifact_exts()
     names = os.listdir(out_dir)
-    if not any(n.endswith(".json") for n in names):
-        orphans = sorted(n for n in names if os.path.splitext(n)[1] in exts)
-        if orphans:
-            raise RuntimeError(
-                f"{out_dir}: kernel artifacts with no sidecar "
-                f"({', '.join(orphans[:4])}{', ...' if len(orphans) > 4 else ''}). "
-                f"The sidecar is written last, so this is an interrupted or "
-                f"hand-edited export; {_CLEAN_HINT.format(d=out_dir)}."
-            )
-        return
-    if specs is None:
-        return
-    live = [_json_normal(p) for p in specs]
-    stale = sorted(
-        fn
-        for fn in names
-        if fn.endswith(".json")
-        and _read_sidecar(os.path.join(out_dir, fn)).get("spec") not in live
+    # Per artifact, not per directory: an interrupt lands among points that already
+    # committed, so "does this directory hold any sidecar" would see nothing wrong.
+    claimed = {os.path.splitext(n)[0] for n in names if n.endswith(".json")}
+    orphans = sorted(
+        n
+        for n in names
+        if os.path.splitext(n)[1] in exts and os.path.splitext(n)[0] not in claimed
     )
+    if orphans:
+        listed = f"{', '.join(orphans[:4])}{', ...' if len(orphans) > 4 else ''}"
+        print(
+            f"{out_dir}: {len(orphans)} artifact(s) no sidecar claims ({listed}); an "
+            f"export died before committing them, or they were copied in by hand. "
+            f"Nothing links an artifact no sidecar names, so the cost is disk: a "
+            f"re-export of that point overwrites it WHILE THE POINT IS STILL IN THE "
+            f"GRID, and otherwise {_CLEAN_HINT.format(d=out_dir)}."
+        )
+    live = [_json_normal(p) for p in specs]
+
+    def _is_stale(fn: str) -> bool:
+        sc = _read_sidecar(os.path.join(out_dir, fn))
+        # SCHEMA FIRST, as everywhere: "spec" is read by name, and a bump that
+        # changed its representation would make the first export in an existing
+        # tree demand `rm -rf` rather than re-export. Another schema is not
+        # stale, it is unreadable.
+        if sc.get("version") != SIDECAR_VERSION:
+            return False
+        return sc.get("spec") not in live
+
+    stale = sorted(fn for fn in names if fn.endswith(".json") and _is_stale(fn))
     if stale:
         raise RuntimeError(
-            f"{out_dir}: sidecars for spec points no longer in the grid "
-            f"({', '.join(stale[:4])}{', ...' if len(stale) > 4 else ''}). "
-            f"Their kernel objects would still be linked with no launcher "
-            f"referencing them; {_CLEAN_HINT.format(d=out_dir)}."
+            f"{out_dir}: {len(stale)} sidecar(s) for spec points no longer in the "
+            f"grid ({', '.join(stale[:4])}{', ...' if len(stale) > 4 else ''}). "
+            f"Generation emits one dispatch branch per sidecar and takes the spec "
+            f"from the sidecar itself, so these would ship a wired-up kernel for a "
+            f"point the grid no longer has; {_CLEAN_HINT.format(d=out_dir)}."
         )
 
 
@@ -543,49 +643,43 @@ def archs_from_cuda_arch_list(arch_list: str) -> list[str]:
     """TORCH_CUDA_ARCH_LIST -> the sm strings from it that are
     EXPORTABLE_ARCHES, order-preserving and deduplicated.
 
-    "9.0a;10.0a" (or space-separated) -> ["sm_100a"]. A +PTX suffix is
-    stripped; named entries ("Hopper") are not translated -- callers
-    should pass numeric lists (CI does). Dedup matters: "10.0;10.0+PTX" names
-    one arch twice, and a repeated entry would otherwise read as
-    multi-arch downstream (nested artifact layout, --jobs > 1)."""
+    "9.0a;10.0a" (or space-separated) -> ["sm_100a"]. A +PTX suffix is stripped;
+    named entries ("Hopper") are not translated, and CI passes numeric lists.
+    Dedup matters because "10.0;10.0+PTX" names one arch twice, which would read
+    as multi-arch downstream.
+
+    ONE arch per compute capability, preferring the arch-conditional spelling:
+    "10.0;10.0a" is one piece of hardware, and exporting both builds two full sets
+    of which generation uses one (_by_arch prefers the conditional, what the
+    kernels were written against). The loser is more than wasted compile time --
+    it used to ship inside libtorch_cuda with no launcher (54 objects / 3.5 MiB
+    measured). CUDA 13.x manywheel lists reach here, so this is the common case."""
     out = []
     for entry in arch_list.replace(";", " ").split():
-        entry = entry.removesuffix("+PTX")
-        parts = entry.split(".")
-        if len(parts) != 2 or not parts[0].isdigit():
-            continue  # named arch ("Hopper") or malformed: skip
-        minor = parts[1]
+        major, _, minor = entry.removesuffix("+PTX").partition(".")
         suffix = "a" if minor.endswith("a") else ""
-        minor_num = minor.removesuffix("a")
-        if not minor_num.isdigit():
-            continue
-        sm = f"sm_{int(parts[0]) * 10 + int(minor_num)}{suffix}"
+        minor = minor.removesuffix("a")
+        # isascii too: str.isdigit is Unicode-aware, so an Arabic-Indic or
+        # full-width digit satisfies it AND converts, which torchgen's sm parsing
+        # rejects for the same reason.
+        if not all(p.isascii() and p.isdigit() for p in (major, minor)):
+            continue  # named arch ("Hopper") or malformed: skip
+        sm = f"sm_{int(major) * 10 + int(minor)}{suffix}"
         if sm in EXPORTABLE_ARCHES and sm not in out:
             out.append(sm)
-    return out
+    # Collapse per capability, keeping the conditional spelling wherever the
+    # list named it. Order-preserving on the survivors.
+    conditional = {a.removesuffix("a") for a in out if a.endswith("a")}
+    return [a for a in out if a.endswith("a") or a not in conditional]
 
 
-# Which TORCH_CUDA_ARCH_LIST entries are ELIGIBLE for AOT kernels on the
-# automatic export path. A filter, never a build list: it cannot cause an
-# export, only permit one, and an explicit --arch bypasses it. So a list
-# with no eligible entry exports nothing and stage 2 skips, printing why.
-#
-# Distinct from a declaration's ARCHS (what the KERNELS support, sm_90+);
-# this says what the standard build SHIPS. Both spellings of a CC are
-# listed because they are distinct nvcc targets used by different builds
-# for the same hardware -- "10.0a" (arch-conditional, needed by
-# tcgen05/wgmma) in b200-native-aot.yml, plain "10.0" elsewhere and in the
-# manywheel lists. Omitting either silently exports nothing there.
-#
-# sm_103/sm_103a are deliberately absent: no release or CI arch list names
-# 10.3, and sm_100 SASS is forward-compatible to it, so nothing is lost by
-# leaving it out. Selection is by full capability (major AND minor), so a
-# 10.3 device declines sm_100 kernels rather than loading them -- adding
-# 10.3 is a line here plus hardware to test it on.
-EXPORTABLE_ARCHES = ("sm_100", "sm_100a")
+# Re-exported: build_stage2 and the tests read the shipped-arch set off the exporter.
+# DEFINED beside the set this tooling can target (torchgen.native_aot_decl), so the
+# two cannot drift; a list with no eligible entry exports nothing and stage 2 skips.
+EXPORTABLE_ARCHES = decl.EXPORTABLE_ARCHES
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default=os.path.join(REPO, "build", "native_aot"))
     parser.add_argument(
@@ -598,10 +692,9 @@ def main() -> None:
         "--jobs",
         type=int,
         default=None,
-        help="parallel compile processes (forkserver). Default follows "
-        "the torch build's parallelism: MAX_JOBS, then "
-        "CMAKE_BUILD_PARALLEL_LEVEL, then half the CPU count -- the same "
-        "pair pyproject.toml's [tool.scikit-build.env] hands to cmake.",
+        help="parallel compile processes (forkserver). Default follows the "
+        "torch build: MAX_JOBS, then CMAKE_BUILD_PARALLEL_LEVEL, then half the "
+        "CPU count.",
     )
     parser.add_argument(
         "--arch",
@@ -611,28 +704,40 @@ def main() -> None:
         help="target architecture(s), e.g. --arch sm_90a sm_100a. With an "
         "explicit arch, export never touches the CUDA driver and runs on "
         "GPU-less machines (CuTeDSL via --gpu-arch; Triton via an "
-        "explicit GPUTarget). Default: detect from the local device. "
-        "Multiple archs nest artifacts under <out-dir>/<arch>/.",
+        "explicit GPUTarget). Default: detect from the local device.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    # An explicit --arch is checked HERE, before anything reads the disk. The same
+    # check used to sit three loops deep (inside the per-declaration, per-arch walk),
+    # where a tree with no declaration never reached it: `--arch sm100a` then matched
+    # nothing and exited 0, the typo-that-looks-like-success this refuses.
+    #
+    # TORCH_CUDA_ARCH_LIST is FILTERED a few lines below rather than refused, because
+    # a release list names arches AOT does not ship (7.5, 8.6) and must not fail the
+    # build for naming them.
+    for named_arch in args.arch or ():
+        if named_arch not in decl.KNOWN_ARCHES:
+            raise RuntimeError(
+                f"--arch {named_arch} is not an arch this tooling knows "
+                f"({' '.join(decl.KNOWN_ARCHES)}). To target another, add it there "
+                f"and give the declaration an ARCHS entry naming it."
+            )
     if args.jobs is None:
         env_jobs = os.getenv("MAX_JOBS") or os.getenv("CMAKE_BUILD_PARALLEL_LEVEL")
         # Half the CPU count, not all of it: os.cpu_count() reports SMT
         # siblings, and one compile per virtual thread oversubscribes.
         args.jobs = int(env_jobs) if env_jobs else max(1, (os.cpu_count() or 2) // 2)
     if args.arch is None and os.getenv("TORCH_CUDA_ARCH_LIST"):
-        # Standard-build integration: export for the Blackwell subset of
-        # the architectures the main build compiled for (the wheel may
-        # run on machines unlike the builder). Explicit --arch wins.
+        # Standard-build integration: export for the exportable subset of what
+        # the main build compiled for. Explicit --arch wins.
         args.arch = archs_from_cuda_arch_list(os.environ["TORCH_CUDA_ARCH_LIST"])
-        if args.arch:
-            print(f"arch from TORCH_CUDA_ARCH_LIST: {' '.join(args.arch)}")
-        else:
+        if not args.arch:
             print(
                 "TORCH_CUDA_ARCH_LIST contains no AOT-exportable arch "
                 f"(exportable: {' '.join(EXPORTABLE_ARCHES)}); nothing to export"
             )
             return
+        print(f"arch from TORCH_CUDA_ARCH_LIST: {' '.join(args.arch)}")
     archs = args.arch if args.arch else [None]
     jobs = _collect_jobs(args.ops, args.out_dir, archs)
     todo = [j for j in jobs if _job_needed(j, args.force)]
