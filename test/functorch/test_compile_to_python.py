@@ -22,9 +22,11 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
+    skipIfTorchDynamo,
     subtest,
     TestCase,
 )
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 from torch.testing._internal.triton_utils import requires_cuda_and_triton
 
 
@@ -202,6 +204,224 @@ class TestAOTCompileToPython(TestCase):
                 self.assertEqual(
                     load_from_python(src, cache)(_flat_inputs(m, x))[0], m(x)
                 )
+
+    @skipIfTorchDynamo(
+        "make_fx of a training closure cannot trace under an outer dynamo"
+    )
+    def test_inline_backward_graph_is_not_lowered_as_inference(self):
+        # A graph that differentiates INLINE (make_fx tracing through a
+        # .backward()) has no joint, so a joint-only check would call it
+        # inference. Inductor's decide_layout_opt branches on that and can
+        # convert a conv to channels-last, which makes cuDNN serve a TF32 NHWC
+        # kernel -- a silent ~2e-4 relative difference in the gradients. The ops
+        # decide, not the graph count.
+        from torch._functorch._aot_autograd.to_standalone_python import (
+            _graph_differentiates,
+        )
+
+        conv = torch.nn.Conv2d(4, 8, 3, padding=1)
+        x = torch.randn(2, 4, 8, 8)
+
+        self.assertFalse(_graph_differentiates(_capture(conv, x)))
+
+        def train_step(*args):
+            names = [n for n, _ in conv.named_parameters()]
+            params = dict(zip(names, args[: len(names)]))
+            with stateless._reparametrize_module(conv, params):
+                conv(args[-1]).sum().backward()
+
+        flat = [t.detach().requires_grad_(True) for t in _flat_inputs(conv, x)]
+        with torch.enable_grad():
+            traced = make_fx(train_step)(*flat)
+        self.assertTrue(_graph_differentiates(traced))
+        self.assertTrue(
+            any("convolution_backward" in str(n.target) for n in traced.graph.nodes)
+        )
+
+    @skipIfTorchDynamo(
+        "the served _CompiledFunction sets boxed_grads_call=True, which compiled "
+        "autograd rejects; a feature limitation, see the module's not-covered list"
+    )
+    def test_training_graph_composes_forward_and_backward(self):
+        # grad_enabled with inputs that require grad makes AOTAutograd emit a
+        # JOINT forward+backward: two dense graphs, bridged by an autograd
+        # Function the composer emits (its forward/backward bodies are
+        # AOTAutograd's own codegen'd source). The served output must therefore
+        # carry grad_fn and its .backward() must run the compiled backward.
+        m = torch.nn.Linear(4, 3)
+        x = torch.randn(5, 4)
+        for p in m.parameters():
+            p.grad = None
+        m(x).sum().backward()
+        expected = {n: p.grad.detach().clone() for n, p in m.named_parameters()}
+
+        gm = _capture(m, x)
+        with torch.enable_grad():
+            src, _cache = compile_to_python(gm, _flat_inputs(m, x), grad_enabled=True)
+        # Both inductor modules and the backward wrappers are inlined as source.
+        self.assertIn("_inner_call_fw", src)
+        self.assertIn("_inner_call_bw", src)
+        self.assertIn("def _backward_prologue(", src)
+        self.assertIn("class _CompiledFunction(torch.autograd.Function):", src)
+        self.assertNotIn("pickle.loads", src)
+
+        out = _exec(src)(_flat_inputs(m, x))
+        out = out[0] if isinstance(out, (list, tuple)) else out
+        self.assertIsNotNone(out.grad_fn)
+        for p in m.parameters():
+            p.grad = None
+        out.sum().backward()
+        for name, param in m.named_parameters():
+            self.assertEqual(param.grad, expected[name])
+
+    def test_training_forward_and_backward_do_not_share_names(self):
+        # The two inductor modules are spliced into ONE namespace and both define
+        # call / Runner / their kernels. A module resolves those as late-bound
+        # globals when INVOKED, so without per-module renaming the forward runs
+        # the backward's kernels -- which surfaces as an arity error, or worse.
+        m = torch.nn.Linear(4, 3)
+        x = torch.randn(5, 4)
+        gm = _capture(m, x)
+        with torch.enable_grad():
+            src, _cache = compile_to_python(gm, _flat_inputs(m, x), grad_enabled=True)
+        tree = ast.parse(src)
+        names = [
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+        ]
+        self.assertEqual(len(names), len(set(names)), f"duplicate top-level: {names}")
+
+    def test_training_compose_refuses_unmodeled_wrappers(self):
+        # Aliased + mutated inputs drive AOTSyntheticBaseWrapper, which the
+        # training compose does not splice. It must REFUSE: silently dropping
+        # the wrapper composes a module whose inner forward was compiled for
+        # the merged synthetic-base calling convention, so it only fails (or
+        # miscomputes) at serve time -- replacing the caller's working
+        # pickled-bundle fallback with a broken artifact.
+        def f(a, b, w):
+            a.mul_(2)
+            return ((a + b) * w).sum()
+
+        def make():
+            base = torch.arange(4, dtype=torch.float32) + 1
+            return base[:], base  # a aliases b
+
+        w = torch.randn(4, requires_grad=True)
+        with torch.enable_grad():
+            gm = make_fx(f)(*make(), w)
+        a0, b0 = make()
+        with (
+            torch.enable_grad(),
+            self.assertRaisesRegex(NotImplementedError, "cannot yet model"),
+        ):
+            compile_to_python(gm, [a0, b0, w], grad_enabled=True)
+
+    def test_training_compose_refuses_inlineable_saved_tensors_hooks(self):
+        # Inlineable (GraphModule) ambient hooks are traced INTO the joint
+        # graph, and at runtime AOTAutograd disables the ambient hooks around
+        # the compiled call so they do not ALSO fire on ctx.save_for_backward.
+        # That disable is plain Python the compose cannot splice, so composing
+        # must refuse: serving would pack already-packed activations.
+        pack_gm = torch.fx.symbolic_trace(lambda x: x * 2)
+        unpack_gm = torch.fx.symbolic_trace(lambda x: x / 2)
+        m = torch.nn.Linear(4, 3)
+        x = torch.randn(5, 4)
+        gm = _capture(m, x)
+        with (
+            torch.enable_grad(),
+            torch.autograd.graph.saved_tensors_hooks(pack_gm, unpack_gm),
+            self.assertRaisesRegex(NotImplementedError, "saved_tensors_hooks"),
+        ):
+            compile_to_python(gm, _flat_inputs(m, x), grad_enabled=True)
+
+    def test_training_backward_lowers_with_is_backward(self):
+        # is_backward gates GraphLowering's backward-only require_contiguous
+        # safeguard for untagged implicit-fallback aten ops (#140452); the
+        # composed training backward must lower the way torch.compile's
+        # backward does. Spy on compile_fx_inner because the safeguard itself
+        # only engages on an op with no lowering, which no small graph has.
+        import torch._inductor.compile_fx as compile_fx_mod
+
+        seen = []
+        orig = compile_fx_mod.compile_fx_inner
+
+        def spy(gm, inputs, **kwargs):
+            seen.append(kwargs.get("is_backward", False))
+            return orig(gm, inputs, **kwargs)
+
+        m = torch.nn.Linear(4, 3)
+        x = torch.randn(5, 4)
+        gm = _capture(m, x)
+        with (
+            torch.enable_grad(),
+            unittest.mock.patch.object(compile_fx_mod, "compile_fx_inner", spy),
+        ):
+            compile_to_python(gm, _flat_inputs(m, x), grad_enabled=True)
+        self.assertEqual(seen, [False, True])  # forward, then backward
+
+    def test_restride_refuses_symbolic_forward_strides(self):
+        # CompiledFxGraph.output_strides entries are PRINTED stride
+        # expressions (strings); under dynamic shapes they are symbolic and
+        # cannot be applied to a static fake. int() on one used to escape as
+        # a raw ValueError; refusing keeps the pickled-bundle fallback.
+        import types as types_mod
+
+        from torch._functorch._aot_autograd.to_standalone_python import (
+            _restride_backward_placeholders,
+        )
+
+        gm = make_fx(lambda x: x * 2)(torch.randn(2, 3))
+        spec = types_mod.SimpleNamespace(
+            fw_metadata=types_mod.SimpleNamespace(
+                tensors_saved_for_backwards_slice=slice(0, 1)
+            ),
+            num_symints_saved_for_bw=0,
+        )
+        # A concrete printed stride still applies.
+        _restride_backward_placeholders(gm, [("3", "1")], spec)
+        with self.assertRaisesRegex(
+            NotImplementedError, "symbolic forward output strides"
+        ):
+            _restride_backward_placeholders(gm, [("3*s0", "1")], spec)
+
+    @unittest.skipIf(not HAS_GPU, "requires gpu")
+    @skipIfTorchDynamo(
+        "the served _CompiledFunction sets boxed_grads_call=True, which compiled "
+        "autograd rejects; a feature limitation, see the module's not-covered list"
+    )
+    def test_training_conv_restride_matches_eager(self):
+        # Conv nets are what the backward restride exists for: inductor's
+        # layout optimization hands back channels-last saved activations, and
+        # a backward lowered against the joint trace's eager strides raises a
+        # size assert -- or, with size asserts off, silently computes wrong
+        # gradients. Layout optimization is FORCED so the restride is
+        # genuinely engaged (at default heuristics this shape keeps contiguous
+        # strides and the test would pass with the restride deleted), and
+        # cuDNN TF32 is off so the gradients compare at default tolerance.
+        with (
+            torch._inductor.config.patch(force_layout_optimization=True),
+            torch.backends.cudnn.flags(enabled=True, allow_tf32=False),
+        ):
+            m = torch.nn.Conv2d(16, 32, 3).to(GPU_TYPE)
+            x = torch.randn(2, 16, 16, 16, device=GPU_TYPE)
+            for p in m.parameters():
+                p.grad = None
+            m(x).sum().backward()
+            expected = {n: p.grad.detach().clone() for n, p in m.named_parameters()}
+
+            gm = _capture(m, x)
+            with torch.enable_grad():
+                src, _cache = compile_to_python(
+                    gm, _flat_inputs(m, x), grad_enabled=True
+                )
+            out = _exec(src)(_flat_inputs(m, x))
+            out = out[0] if isinstance(out, (list, tuple)) else out
+            for p in m.parameters():
+                p.grad = None
+            out.sum().backward()
+            for name, param in m.named_parameters():
+                self.assertEqual(param.grad, expected[name])
 
     def test_linear_addmm_runs_like_eager(self):
         m = torch.nn.Linear(4, 3).eval()
