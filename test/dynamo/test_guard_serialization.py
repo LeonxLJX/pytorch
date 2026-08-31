@@ -911,6 +911,27 @@ class TestGuardSerialization(TestGuardSerializationBase):
         out = pickle.loads(buf.getvalue())
         self.assertEqual(out.__module__, fn.__module__)
 
+    def test_retained_grad_non_leaf_survives_pickle(self):
+        # .grad is dropped from the pickle for plain non-leafs (reading it
+        # warns and is None), but a RETAINED-grad non-leaf -- which torch.optim
+        # explicitly permits as a param -- has a real .grad that a guard can
+        # chain through; dropping it breaks such a load with an AttributeError.
+        from torch._dynamo.guards import GuardsStatePickler
+
+        base = torch.randn(4, requires_grad=True)
+        x = base * 1
+        x.retain_grad()
+        x.sum().backward()
+        grad = x.grad
+        self.assertIsNotNone(grad)
+        buf = io.BytesIO()
+        gtv = {id(x): x, id(grad): grad}
+        pickler = GuardsStatePickler(gtv, {}, {}, buf)
+        pickler.dump(x)
+        out = pickle.loads(buf.getvalue())
+        self.assertIsNotNone(out.grad)
+        self.assertEqual(out.grad.shape, grad.shape)
+
     def test_fqn_mismatched_function_prunes_unguarded_defaults(self):
         mod = DecoratedUnpicklableDefaultForwardModule()
         ref, loaded = self._test_serialization("EQUALS_MATCH", mod, torch.randn(3))
@@ -936,6 +957,47 @@ class TestGuardSerialization(TestGuardSerializationBase):
             ref, loaded, {"x": torch.randn(2, dtype=torch.float64)}, False
         )
         self._test_check_fn(ref, loaded, {"x": None}, False)
+
+    def test_tensor_subclass_requires_grad_survives(self):
+        # A wrapper subclass is rebuilt by __tensor_unflatten__, which derives
+        # the outer's requires_grad from its inners -- so a subclass carrying
+        # autograd metadata of its own reloaded as requires_grad=False and the
+        # rebuilt guard then rejected every training input, permanently.
+        from torch.testing._internal.two_tensor import TwoTensor
+
+        def f(x: torch.Tensor):
+            return x + 1
+
+        tt = TwoTensor(torch.randn(3), torch.randn(3)).requires_grad_(True)
+        self.assertFalse(tt.a.requires_grad)
+        ref, loaded = self._test_serialization("TENSOR_MATCH", f, tt)
+        self._test_check_fn(ref, loaded, {"x": tt}, True)
+        self._test_check_fn(
+            ref, loaded, {"x": TwoTensor(torch.randn(3), torch.randn(3))}, False
+        )
+
+    def test_tensor_match_through_a_python_attribute(self):
+        # A tensor is reconstructed from its metadata, which does not include a
+        # plain Python attribute someone assigned onto it -- so a guard whose
+        # SOURCE traverses one could not be rebuilt at all, and the whole state
+        # failed to load with AttributeError.
+        def f(x: torch.Tensor):
+            return x + x.companion
+
+        x = torch.ones(2)
+        x.companion = torch.ones(2)
+        ref, loaded = self._test_serialization("TENSOR_MATCH", f, x)
+
+        def with_companion(companion):
+            t = torch.randn(2)
+            t.companion = companion
+            return {"x": t}
+
+        self._test_check_fn(ref, loaded, with_companion(torch.randn(2)), True)
+        self._test_check_fn(ref, loaded, with_companion(torch.randn(3)), False)
+        self._test_check_fn(
+            ref, loaded, with_companion(torch.randn(2, dtype=torch.float64)), False
+        )
 
     def test_not_present_in_generic_dict(self):
         class Module(torch.nn.Module):
