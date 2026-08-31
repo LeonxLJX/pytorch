@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 import functools
 import itertools
+import operator
 from collections.abc import Callable
 from typing import Any
 
@@ -885,17 +886,66 @@ def associative_scan_functionalize(ctx, combine_fn, xs, additional_inputs):
     return ctx.wrap_tensors(ret)
 
 
+def _combine_fn_is_elementwise(combine_fn, xs, additional_inputs) -> bool:
+    """Whether ``combine_fn`` traces to a graph of purely elementwise ops.
+
+    Stricter than dynamo's `combine_mode="pointwise"` check (using `is_pointwise_use`).
+    The direct call instead the trailing batch axis to be inert,
+    which any view (allowed by `is_pointwise_use`) would breaks..
+    """
+    sample_slices = [first_slice_copy(x) for x in xs]
+    try:
+        gm = materialize_as_graph(
+            combine_fn, (*sample_slices, *sample_slices, *additional_inputs)
+        )
+    except Exception:
+        # Fall back to the base re-vmap path, which is correct for any combine_fn,
+        # but slower.
+        return False
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target is operator.getitem:
+            continue
+        if (
+            not isinstance(node.target, torch._ops.OpOverload)
+            or torch.Tag.pointwise not in node.target.tags
+        ):
+            return False
+    return True
+
+
+class _PointwiseVmapCombineFnWrapper(_VmapCombineFnWrapper):
+    """``_VmapCombineFnWrapper`` specialization for a pointwise ``combine_fn``.
+
+    Calling ``combine_fn`` directly on the last-axis-batched args avoids permutes
+    ``_VmapCombineFnWrapper`` would trigger.
+    """
+
+    def __call__(self, *args: Any) -> Any:
+        # A direct call needs the trailing batch axis present on every arg; with a
+        # mix of batched and unbatched args only the base path broadcasts correctly.
+        if not all(bdim is not None for bdim in self.in_dims):
+            return super().__call__(*args)
+        outputs = self.combine_fn(*args)
+        # All inputs are batched at -1 and combine_fn is elementwise, so every
+        # output leaf is batched at -1 too.
+        out_dims = tuple(-1 for _ in pytree.tree_leaves(outputs))
+        if self.expected_out_dims is not None and out_dims != self.expected_out_dims:
+            raise RuntimeError(
+                "associative_scan under vmap requires the combine_fn outputs to keep "
+                "the same batched arguments as its xs inputs, because the outputs are "
+                "fed back as inputs on later scan levels. Here they diverge: expected "
+                f"output batch dims {self.expected_out_dims} but got {out_dims}."
+            )
+        self.out_dims = out_dims
+        return outputs
+
+
 # Note [associative_scan vmap coverage]
-# This batch rule is dispatched only when the associative_scan_op HOP is present
-# under a vmap layer. The frontend builds that HOP for combine_mode="pointwise";
-# combine_mode="generic" is a pure-Python decomposition (generic_associative_scan)
-# that never constructs the HOP, so vmap over a generic scan is handled entirely
-# by the batching rules of the individual aten ops and never reaches this rule.
-# Consequently only the pointwise cases in the vmap tests exercise the code below;
-# the generic cases guard the frontend decomposition instead. This rule is itself
-# device-agnostic, since in eager the HOP dense-decomposes on any device; the
-# CUDA-only parametrization of those tests and the compile-time lowering failure
-# are properties of the lowered pointwise scan, not of this rule.
+# Only combine_mode="pointwise" builds the associative_scan_op HOP, so only the
+# pointwise vmap tests reach this rule; combine_mode="generic" decomposes in Python
+# (generic_associative_scan) and is batched by the individual aten ops instead. The
+# rule itself is device-agnostic -- the CUDA-only vmap tests are gated by the lowered
+# pointwise scan, not by anything here.
 @associative_scan_op.py_impl(torch._C._functorch.TransformType.Vmap)
 def associative_scan_batch_rule(interpreter, combine_fn, xs, additional_inputs):
     unbatched_args, in_dims = unwrap_batched(
@@ -913,11 +963,18 @@ def associative_scan_batch_rule(interpreter, combine_fn, xs, additional_inputs):
     after_move_dims = (*xs_move_dims, *xs_move_dims, *additional_move_dims)
 
     with interpreter.lower():
+        wrapper_cls = (
+            _PointwiseVmapCombineFnWrapper
+            if _combine_fn_is_elementwise(
+                combine_fn, unbatched_xs, unbatched_additional_inputs
+            )
+            else _VmapCombineFnWrapper
+        )
         # generic_associative_scan feeds combine_fn outputs back as the left-hand
         # args on later levels, reusing after_move_dims; that is only valid if the
         # outputs keep the same batch dims as xs. expected_out_dims makes the wrapper
         # raise a clear error otherwise instead of silently mismatching downstream.
-        wrapper = _VmapCombineFnWrapper(
+        wrapper = wrapper_cls(
             combine_fn,
             after_move_dims,
             interpreter.batch_size(),
