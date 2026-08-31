@@ -5061,6 +5061,26 @@ class PropertyVariable(VariableTracker):
         *VariableTracker._nonvar_fields,
     }
 
+    tp_members = {
+        "fget": Member(getset_build(lambda s: s.descriptor.fget), readonly_setter),
+        "fset": Member(getset_build(lambda s: s.descriptor.fset), readonly_setter),
+        "fdel": Member(getset_build(lambda s: s.descriptor.fdel), readonly_setter),
+        "__doc__": Member(
+            getset_load_or_build(lambda s: s.descriptor.__doc__, "__doc__"),
+            getset_set("__doc__"),
+        ),
+    }
+
+    tp_getset = {
+        "__name__": GetSet(
+            getset_load_or_build(lambda s: s.descriptor.__name__, "__name__"),
+            getset_set("__name__"),
+        ),
+        "__isabstractmethod__": GetSet(
+            getset_build(lambda s: s.descriptor.__isabstractmethod__), readonly_setter
+        ),
+    }
+
     def __init__(
         self,
         descriptor: property,
@@ -5078,6 +5098,37 @@ class PropertyVariable(VariableTracker):
 
     def as_python_constant(self) -> property:
         return self.descriptor
+
+    def tp_descr_set_impl(
+        self,
+        tx: "InstructionTranslatorBase",
+        obj: VariableTracker,
+        value: VariableTracker | None,
+    ) -> VariableTracker:
+        fn = self.descriptor.fset if value is not None else self.descriptor.fdel
+
+        if fn is None:
+            fget_name = getattr(self.descriptor.fget, "__name__", "?")
+            raise_attribute_error(
+                tx,
+                f"property '{fget_name}' of "
+                f"'{obj.python_type_name()}' object "
+                f"has no {'setter' if value is not None else 'deleter'}",
+            )
+
+        if value is None:
+            fdel_source = self.source and AttrSource(self.source, "fdel")
+            fdel_vt = VariableTracker.build(
+                tx, self.descriptor.fdel, source=fdel_source
+            )
+            fdel_vt.call_function(tx, [obj], {})
+        else:
+            fset_source = self.source and AttrSource(self.source, "fset")
+            fset_vt = VariableTracker.build(
+                tx, self.descriptor.fset, source=fset_source
+            )
+            fset_vt.call_function(tx, [obj, value], {})
+        return ConstantVariable.create(None)
 
     def tp_descr_get_impl(
         self,
