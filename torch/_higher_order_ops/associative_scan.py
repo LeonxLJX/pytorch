@@ -923,18 +923,18 @@ class _PointwiseVmapCombineFnWrapper(_VmapCombineFnWrapper):
     def __call__(self, *args: Any) -> Any:
         # A direct call needs the trailing batch axis present on every arg; with a
         # mix of batched and unbatched args only the base path broadcasts correctly.
-        if not all(bdim is not None for bdim in self.in_dims):
+        if any(bdim is None for bdim in self.in_dims):
             return super().__call__(*args)
         outputs = self.combine_fn(*args)
-        # All inputs are batched at -1 and combine_fn is elementwise, so every
-        # output leaf is batched at -1 too.
+        # Every input is batched at -1 and this wrapper is only selected for an
+        # elementwise combine_fn, so every output leaf is batched at -1 too.
         out_dims = tuple(-1 for _ in pytree.tree_leaves(outputs))
-        if self.expected_out_dims is not None and out_dims != self.expected_out_dims:
-            raise RuntimeError(
-                "associative_scan under vmap requires the combine_fn outputs to keep "
-                "the same batched arguments as its xs inputs, because the outputs are "
-                "fed back as inputs on later scan levels. Here they diverge: expected "
-                f"output batch dims {self.expected_out_dims} but got {out_dims}."
+        # Mirror the base wrapper's cross-step consistency guard: out_dims must not
+        # change between scan steps.
+        if self.out_dims is not None and out_dims != self.out_dims:
+            raise AssertionError(
+                "combine_fn produced inconsistent output batch dims across scan "
+                f"steps: {self.out_dims} then {out_dims}"
             )
         self.out_dims = out_dims
         return outputs
@@ -958,39 +958,47 @@ def associative_scan_batch_rule(interpreter, combine_fn, xs, additional_inputs):
     xs_in_dims, additional_in_dims = in_dims
     xs_move_dims = _batch_dims_as_last_for_scan(xs_in_dims)
     additional_move_dims = _batch_dims_as_last_for_scan(additional_in_dims)
-    # combine_fn is called with (lhs xs leaves, rhs xs leaves, additional_inputs),
-    # so the xs batch-dim markers must be duplicated. See generic_associative_scan.
-    after_move_dims = (*xs_move_dims, *xs_move_dims, *additional_move_dims)
+    batch_size = interpreter.batch_size()
 
     with interpreter.lower():
+        # generic_associative_scan feeds combine_fn outputs back as the left-hand
+        # args on later scan levels, so every output leaf must carry the same batch
+        # dim as its xs leaf. Thus expand every unbatched xs leaf to the batch size.
+        # The expansion is unconditional and intentional.
+        # Rather than expanding only the leaves whose combine output diverges, it also
+        # expands otherwise-unbatched xs for soundness.
+        reconciled_xs = [
+            x.unsqueeze(-1).expand(*x.shape, batch_size) if xd is None else x
+            for x, xd in zip(unbatched_xs, xs_move_dims)
+        ]
+        xs_run_dims = tuple(-1 for _ in unbatched_xs)
+        run_move_dims = (*xs_run_dims, *xs_run_dims, *additional_move_dims)
+
         wrapper_cls = (
             _PointwiseVmapCombineFnWrapper
             if _combine_fn_is_elementwise(
-                combine_fn, unbatched_xs, unbatched_additional_inputs
+                combine_fn, reconciled_xs, unbatched_additional_inputs
             )
             else _VmapCombineFnWrapper
         )
-        # generic_associative_scan feeds combine_fn outputs back as the left-hand
-        # args on later levels, reusing after_move_dims; that is only valid if the
-        # outputs keep the same batch dims as xs. expected_out_dims makes the wrapper
-        # raise a clear error otherwise instead of silently mismatching downstream.
         wrapper = wrapper_cls(
-            combine_fn,
-            after_move_dims,
-            interpreter.batch_size(),
-            interpreter.randomness(),
-            expected_out_dims=xs_move_dims,
-            op_name="associative_scan",
+            combine_fn, run_move_dims, batch_size, interpreter.randomness()
         )
         unwrapped_out = associative_scan_op(
-            wrapper, unbatched_xs, unbatched_additional_inputs
+            wrapper, reconciled_xs, unbatched_additional_inputs
         )
 
-    out_dims = wrapper.out_dims
-    if out_dims is None:
-        # Scan was a no-op (scan length < 2): the combine_fn is never called, so
-        # outputs alias xs one-to-one and their batch dims equal the xs batch dims.
-        out_dims = xs_move_dims
+    # Every reconciled xs leaf is batched at -1, so every combine_fn output leaf is
+    # too. Surface a clear error if a combine leaf unexpectedly drops its batch dependence.
+    assumed_out_dims = tuple(-1 for _ in unwrapped_out)
+    out_dims = wrapper.out_dims if wrapper.out_dims is not None else assumed_out_dims
+    if out_dims != assumed_out_dims:
+        raise RuntimeError(
+            "associative_scan under vmap expected every combine_fn output leaf to "
+            f"stay batched at the last axis, but got out_dims {out_dims}: a combine_fn "
+            "output leaf dropped its batch dependence, which the batch rule cannot "
+            "represent."
+        )
     # wrap_batched matches bdims against the output container; associative_scan_op
     # returns a list, so pass a tuple to align with the tuple out_dims.
     return wrap_batched(tuple(unwrapped_out), out_dims, interpreter.level())
