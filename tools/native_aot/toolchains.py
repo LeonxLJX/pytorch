@@ -50,9 +50,9 @@ Properties consumed by the driver scripts:
   * ``NARROWS_SHAPES_TO_INT32``: the exported ABI takes i32 extents, so
     gen_aot_lib emits a stub gate declining dims past INT32_MAX.
   * ``ARCH_ENV_VAR``: env var this kind reads when no arch is passed
-    explicitly; export._effective_arch resolves it so the sidecar records
-    the arch actually compiled for and a run that changes only that
-    variable is not skipped as already exported.
+    explicitly. export REFUSES it rather than resolving it: it answers for
+    one kind, so with two kinds registered a tree named for its value held
+    sidecars recording the detected arch. Pass --arch instead.
 
 Export runs as stage 2 of the two-stage build (build torch -> build
 the AOT lib), so torch is always importable during export.
