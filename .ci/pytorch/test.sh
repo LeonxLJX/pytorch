@@ -488,6 +488,8 @@ test_python_smoke_b200() {
       nn/attention/test_fa4 \
       nn/attention/test_open_registry \
       python_native/test_cutedsl_smoketest \
+      python_native/test_sum_cutedsl \
+      python_native/test_sum_inner_tree_plan \
       python_native/test_inner_tree_order \
       python_native/test_kernel_coltile \
       python_native/test_kernel_xcta \
