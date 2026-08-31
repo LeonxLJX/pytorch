@@ -10143,24 +10143,37 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         else:
             self.assertEqual(res, (a + 1, a - 1))
 
+    @parametrize("compile_mode", ["none", "compile"])
+    @parametrize("nOutputs", [1, 2])
     @parametrize("bdim", [0, 1])
-    def test_cond_vmap_batched_pred(self, bdim):
+    def test_cond_vmap_batched_pred(self, compile_mode, nOutputs, bdim):
         def fn(pred, x):
             return torch.cond(
                 pred=pred,
-                true_fn=lambda x: (x.sin(),),
-                false_fn=lambda x: (x.cos(),),
+                true_fn=lambda x: (x.sin(), x + 1)[:nOutputs],
+                false_fn=lambda x: (x.cos(), x - 1)[:nOutputs],
                 operands=(x,),
             )
 
         pred = torch.tensor([True, False, True, False])
-        x = torch.rand(4, 3)
+        x = torch.rand(4, 3, requires_grad=True)
         if bdim == 1:
             pred, x = pred.unsqueeze(0), x.movedim(0, 1)
-        expected = torch.stack(
-            [fn(pred.select(bdim, i), x.select(bdim, i))[0] for i in range(4)]
-        )
-        self.assertEqual(torch.vmap(fn, in_dims=(bdim, bdim))(pred, x)[0], expected)
+        expected = [fn(pred.select(bdim, i), x.select(bdim, i)) for i in range(4)]
+
+        vmapped = torch.vmap(fn, in_dims=(bdim, bdim))
+        out = compile_mode_helper(vmapped, compile_mode)(pred, x)
+        self.assertEqual(len(out), nOutputs)
+        for i in range(nOutputs):
+            self.assertEqual(out[i], torch.stack([e[i] for e in expected]))
+
+        # Verify gradients flow correctly through torch.where selection for all outputs.
+        # Use a single grad call to avoid retain_graph bookkeeping across outputs.
+        all_out = [o.sum() for o in out]
+        all_expected = [torch.stack([e[i] for e in expected]).sum() for i in range(nOutputs)]
+        grads = torch.autograd.grad(all_out, [x], grad_outputs=[torch.ones(1)] * nOutputs)
+        expected_grads = torch.autograd.grad(all_expected, [x], grad_outputs=[torch.ones(1)] * nOutputs)
+        self.assertEqual(grads, expected_grads, atol=1e-5, rtol=1e-5)
 
     @parametrize("boolcond", [True, False])
     def test_vmap_vmap(self, boolcond):
