@@ -8,6 +8,7 @@
 #   contiguous last-dim, smem-fits   -> kernel_rowtile   (one-shot)
 #   contiguous last-dim, larger N    -> kernel_xcta      (fused cross-CTA split)
 #   prime / awkward N                -> _two_stage_row   (ragged split, K0 body)
+#   dim-0 (columns)                  -> kernel_coltile   (reduced-axis split)
 #   every kept extent 1              -> reduce_all
 #   anything only K0 could serve     -> declined to aten by the cond
 #
@@ -548,7 +549,7 @@ def _flat(x):
 # (-> the cond declines, aten takes it). ---
 
 
-def fast_kind(red_pairs, kept_pairs, nouts, has_index):
+def fast_kind(red_pairs, kept_pairs, nouts):
     """Which fast kernel serves this TI-decomposed reduction, or None (-> K0/aten).
 
     "row"     : reduced axis is the single contiguous (stride-1) innermost run;
@@ -556,7 +557,10 @@ def fast_kind(red_pairs, kept_pairs, nouts, has_index):
                 last dim -> the row kernels / xcta. Any nouts / index trait.
     "col"     : kept axis is the single contiguous (stride-1) innermost run;
                 reduced is a single run. Reshape to (prod(red), prod(kept)),
-                reduce dim 0 -> K2. ONLY nouts==1 non-index (K2 is value-only).
+                reduce dim 0 -> the tile body's col axis. nouts==1, index traits
+                included: that path carries the ABSOLUTE reduced index, so
+                argmax/argmin over the reduced axis are exact (ties included).
+                nouts==2 (max.dim/aminmax over dim 0) still falls to None.
     "all"     : no kept dims (full reduction) -> xcta / two-stage. Any trait.
     None      : neither -- only the K0 general kernel could serve it; the cond
                 declines to aten instead (K0 is far slower than aten's kernel).
@@ -574,7 +578,7 @@ def fast_kind(red_pairs, kept_pairs, nouts, has_index):
         return None
     if red_pairs[0][1] == 1:  # reduced run is innermost/contiguous -> row
         return "row"
-    if kept_pairs[0][1] == 1 and nouts == 1 and not has_index:  # kept innermost -> col
+    if kept_pairs[0][1] == 1 and nouts == 1:  # kept innermost -> col
         return "col"
     return None
 
@@ -784,14 +788,23 @@ def _reduce(trait, trait_key, x, dims, out_dtypes, nouts, block=_K0_BLOCK):
     # and for the case a fast kernel itself declines (e.g. xcta on a prime N).
     if len(out_shape) > 0 and x.is_contiguous():
         red_pairs, kept_pairs = _ti_pairs(x, _probe(x, red_axes))
-        has_index = getattr(trait, "has_index", False)
-        kind = fast_kind(red_pairs, kept_pairs, nouts, has_index)
+        kind = fast_kind(red_pairs, kept_pairs, nouts)
         red_n = x.numel() // max(1, math.prod(out_shape))
         if kind == "row":
             x2 = x.reshape(math.prod(out_shape), red_n)
             fast = _try_fast_row(trait, trait_key, x2, out_dtypes, nouts)
             if fast is not None:
                 return tuple(o.reshape(out_shape) for o in fast)
+        elif kind == "col":
+            # The tile body's COLUMN axis. It splits the REDUCED axis (rows) so the reduction
+            # carries parallelism of its own rather than relying on the column count for all
+            # of it, which is what makes a tall-narrow input work: MEASURED vs ATen,
+            # (65536, 256) fp32 sum 7.24x, (16384, 1024) 2.53x, (4096, 4096) 1.49x.
+            from . import kernel_coltile as ct
+
+            x2 = x.reshape(red_n, math.prod(out_shape))
+            out = ct.reduce_col_tile(trait, trait_key, x2, out_dtypes[0])
+            return (_as_shape(out, out_shape),)
 
     outs = [torch.empty(out_shape, device=x.device, dtype=d) for d in out_dtypes]
     num_o = max(1, math.prod(out_shape))  # blocks (kept coordinates)
