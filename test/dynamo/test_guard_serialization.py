@@ -1079,8 +1079,43 @@ class TestGuardSerialization(TestGuardSerializationBase):
 
         with self.assertRaisesRegex(
             PackageError, "ID_MATCH guard cannot be serialized."
-        ):
+        ) as cm:
             self._test_serialization("ID_MATCH", fn, torch.randn(3))
+        # The typed error names the failing guard; consumers must not have to
+        # parse the message.
+        self.assertIsInstance(cm.exception, torch._dynamo.exc.GuardSerializationError)
+        self.assertEqual(cm.exception.guard_type, "ID_MATCH")
+        self.assertTrue(cm.exception.guard_name)
+
+    @torch._dynamo.config.patch({"strict_precompile": False})
+    def test_nonstrict_package_serialization_failure_is_typed(self):
+        # On the non-strict package path the CheckFunctionManager swallows the
+        # serialization failure; convert_frame must then raise a typed
+        # PackageError CHAINED to the specific GuardSerializationError, not a
+        # bare AssertionError consumers can only string-match.
+        from torch._dynamo.package import CompilePackage
+
+        def fn(x):
+            return x + id(x)
+
+        torch._dynamo.reset()
+        package = CompilePackage(fn)
+        compiled = torch._dynamo.optimize(backend="eager", package=package)(fn)
+        try:
+            with self.assertRaisesRegex(
+                PackageError, "guards_state must not be None"
+            ) as cm:
+                compiled(torch.randn(3))
+            cause = cm.exception.__cause__
+            self.assertIsInstance(cause, torch._dynamo.exc.GuardSerializationError)
+            self.assertEqual(cause.guard_type, "ID_MATCH")
+            # The stored exception must be traceback-stripped: a live
+            # __traceback__ pins the guard-build frames (GuardBuilder with the
+            # user scopes, OutputGraph) on the long-lived CheckFunctionManager,
+            # leaking them once per suppressed failure.
+            self.assertIsNone(cause.__traceback__)
+        finally:
+            torch._dynamo.reset()
 
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_id_match_with_config(self):
