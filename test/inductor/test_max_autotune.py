@@ -5920,6 +5920,8 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
 )
 @instantiate_parametrized_tests
 class TestTDMConfigDenseAndGeneric(TestCase):
+    _PREREQS = "torch._inductor.utils._gfx1250_device_prereqs"
+
     def test_tdm_arch_gate_accepts_only_gfx1250(self):
         from torch._inductor.utils import is_gfx1250_arch
 
@@ -5929,8 +5931,11 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         self.assertFalse(is_gfx1250_arch("gfx0000"))
         self.assertFalse(is_gfx1250_arch("amd-gfx1250"))
 
-    def test_tdm_device_gate_uses_runtime_floor_and_backend_probe(self):
-        from torch._inductor.utils import _gfx1250_tdm_enabled, _rocm_version_at_least
+    def test_tdm_device_prereqs_use_runtime_floor_and_backend_probe(self):
+        from torch._inductor.utils import (
+            _gfx1250_device_prereqs,
+            _rocm_version_at_least,
+        )
 
         props = mock.Mock(gcnArchName="gfx1250:sramecc+:xnack-")
         device = torch.device("cuda")
@@ -5942,7 +5947,6 @@ class TestTDMConfigDenseAndGeneric(TestCase):
 
         _rocm_version_at_least.cache_clear()
         with (
-            config.patch({"triton.enable_tdm": True}),
             mock.patch("torch.version.hip", "7.14"),
             mock.patch("torch.cuda.get_device_properties", return_value=props),
             mock.patch(
@@ -5950,12 +5954,11 @@ class TestTDMConfigDenseAndGeneric(TestCase):
                 return_value=False,
             ) as supports_tdm,
         ):
-            self.assertFalse(_gfx1250_tdm_enabled(device))
+            self.assertFalse(_gfx1250_device_prereqs(device))
             supports_tdm.assert_called_once_with("gfx1250:sramecc+:xnack-")
 
         _rocm_version_at_least.cache_clear()
         with (
-            config.patch({"triton.enable_tdm": True}),
             mock.patch("torch.version.hip", "7.14"),
             mock.patch("torch.cuda.get_device_properties", return_value=props),
             mock.patch(
@@ -5963,15 +5966,16 @@ class TestTDMConfigDenseAndGeneric(TestCase):
                 return_value=True,
             ),
         ):
-            self.assertTrue(_gfx1250_tdm_enabled(device))
+            self.assertTrue(_gfx1250_device_prereqs(device))
 
         _rocm_version_at_least.cache_clear()
         with (
-            config.patch({"triton.enable_tdm": True}),
             mock.patch("torch.version.hip", "7.13"),
-            mock.patch("torch.cuda.get_device_properties", return_value=props),
+            mock.patch("torch.cuda.get_device_properties") as get_props,
         ):
-            self.assertFalse(_gfx1250_tdm_enabled(device))
+            self.assertFalse(_gfx1250_device_prereqs(device))
+            # The version floor must short-circuit before the device probe.
+            get_props.assert_not_called()
 
     def test_tdm_backend_probe_strips_arch_features(self):
         from torch.utils._triton import has_triton_amd_tdm_device
@@ -6008,7 +6012,8 @@ class TestTDMConfigDenseAndGeneric(TestCase):
 
         with (
             V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            config.patch({"triton.enable_persistent_tma_matmul": True}),
+            mock.patch(self._PREREQS, return_value=True),
         ):
             self.assertTrue(
                 use_triton_tdm_template(
@@ -6046,7 +6051,8 @@ class TestTDMConfigDenseAndGeneric(TestCase):
 
         with (
             V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            config.patch({"triton.enable_persistent_tma_matmul": True}),
+            mock.patch(self._PREREQS, return_value=True) as device_prereqs,
         ):
             self.assertFalse(use_triton_tdm_template(make_mat("A"), make_mat("B")))
             self.assertFalse(
@@ -6058,7 +6064,14 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             self.assertFalse(
                 use_triton_tdm_template(make_mat("C", stride=(65, 1)), make_mat("B"))
             )
-            self.assertTrue(use_triton_tdm_template(make_mat("C"), make_mat("B")))
+            valid = (make_mat("C"), make_mat("B"))
+            self.assertTrue(use_triton_tdm_template(*valid))
+            # Disabling the shared switch must reject these same operands
+            # without probing the device or Triton.
+            device_prereqs.reset_mock()
+            with config.patch({"triton.enable_persistent_tma_matmul": False}):
+                self.assertFalse(use_triton_tdm_template(*valid))
+            device_prereqs.assert_not_called()
             # Logical tails need not be 16-byte multiples when the descriptor
             # block and row stride satisfy the selected direct-path policy.
             self.assertTrue(
@@ -6131,7 +6144,8 @@ class TestTDMConfigDenseAndGeneric(TestCase):
 
         with (
             V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            config.patch({"triton.enable_persistent_tma_matmul": True}),
+            mock.patch(self._PREREQS, return_value=True),
         ):
             accepted_dim = graph.sizevars.shape_env.create_symbol(
                 128,
@@ -6359,7 +6373,8 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         symbols = {dim}
         with (
             V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            config.patch({"triton.enable_persistent_tma_matmul": True}),
+            mock.patch(self._PREREQS, return_value=True),
         ):
             self.assertTrue(
                 use_triton_tdm_template(make_mat("a", dim), make_mat("b", dim))
@@ -6452,10 +6467,7 @@ class TestTDMConfigDenseAndGeneric(TestCase):
                 torch.device("cuda"), torch.float16, (128, 65), (65, 1), 0
             ),
         )
-        with (
-            V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
-        ):
+        with V.set_graph_handler(graph):
             with self.assertRaisesRegex(AssertionError, "commit revalidation failed"):
                 commit_tdm_operand_layout(unaligned, unaligned)
 
@@ -6532,19 +6544,16 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         from torch._inductor.utils import use_gfx1250_descriptor_codegen
 
         device = torch.device("cuda")
-        base = {
-            "triton.enable_tdm": True,
-            "triton.use_tensor_descriptor": True,
-            "assume_aligned_inputs": True,
-        }
-        with mock.patch(
-            "torch._inductor.utils._gfx1250_device_prereqs", return_value=True
-        ):
+        base = {"triton.use_tensor_descriptor": True, "assume_aligned_inputs": True}
+        with mock.patch(self._PREREQS, return_value=True):
             with config.patch(base):
                 self.assertTrue(use_gfx1250_descriptor_codegen(device))
             for option in base:
                 with config.patch({**base, option: False}):
                     self.assertFalse(use_gfx1250_descriptor_codegen(device))
+        # Same enabled config, capability false: the device probe contains it.
+        with mock.patch(self._PREREQS, return_value=False), config.patch(base):
+            self.assertFalse(use_gfx1250_descriptor_codegen(device))
 
     def test_tdm_generic_descriptor_checker_preserves_backend_dtype_policy(self):
         from torch._inductor.codegen.triton import TMACompatibilityChecker
@@ -6883,7 +6892,7 @@ class TestTDMEndToEnd(TestCase):
         with config.patch(
             {
                 "max_autotune": True,
-                "triton.enable_tdm": True,
+                "triton.enable_persistent_tma_matmul": True,
                 "test_configs.autotune_choice_name_regex": "mm_persistent_tdm",
             }
         ):
@@ -6892,7 +6901,6 @@ class TestTDMEndToEnd(TestCase):
     def _compile_generic_and_get_code(self, fn, *args):
         with config.patch(
             {
-                "triton.enable_tdm": True,
                 "triton.use_tensor_descriptor": True,
                 "assume_aligned_inputs": True,
             }

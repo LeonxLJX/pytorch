@@ -603,6 +603,8 @@ def batch_reserve(paged_attention: PagedAttention, target_seq_len: Tensor):
     "ROCm-specific TDM host-side test; no TDM-capable device required",
 )
 class TestFlexAttentionTDMOptions(InductorTestCase):
+    _PREREQS = "torch._inductor.utils._gfx1250_device_prereqs"
+
     def test_flex_tdm_gate_checks_layout_and_offset(self):
         from torch._inductor.utils import use_flex_tdm_descriptor
         from torch._inductor.virtualized import V
@@ -646,7 +648,7 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
         graph = mock.Mock(sizevars=FakeSizeVars(), unaligned_buffers=set())
         with (
             V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            mock.patch(self._PREREQS, return_value=True) as device_prereqs,
         ):
             self.assertTrue(use_flex_tdm_descriptor(good, good, good))
             self.assertFalse(use_flex_tdm_descriptor(good, good, bad_head))
@@ -669,6 +671,10 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
                     block_shapes=tail_block_shapes,
                 )
             )
+            # Flex has no config switch, so capability is its only enablement
+            # boundary; these operands passed every layout check above.
+            device_prereqs.return_value = False
+            self.assertFalse(use_flex_tdm_descriptor(good, good, good))
 
     def test_flex_tdm_gate_preserves_dynamic_sequence_lengths(self):
         from torch._dynamo.source import ConstantSource
@@ -714,7 +720,7 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
         guards_before = len(graph.sizevars.shape_env.guards)
         with (
             V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            mock.patch(self._PREREQS, return_value=True),
         ):
             # Admission is list-wide, as it is for the MM templates: `value` is
             # rejected, so the earlier-checked `query` and `key` must not be
@@ -787,7 +793,7 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
         graph = mock.Mock(sizevars=FakeSizeVars(), unaligned_buffers=set())
         with (
             V.set_graph_handler(graph),
-            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            mock.patch(self._PREREQS, return_value=True),
             self.assertLogs("torch._inductor.utils", level="DEBUG") as logs,
         ):
             self.assertFalse(
@@ -811,8 +817,8 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
 )
 class TestFlexAttentionTDMEndToEnd(InductorTestCase):
     def _compile_and_get_code(self, fn, *args):
-        with config.patch({"triton.enable_tdm": True}):
-            return run_and_get_code(torch.compile(fn), *args)
+        # Flex TDM selection is capability- and layout-driven; no config opt-in.
+        return run_and_get_code(torch.compile(fn), *args)
 
     def test_tdm_flex_forward_correctness_and_selection(self):
         def fn(q, k, v):

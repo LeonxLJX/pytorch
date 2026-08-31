@@ -2185,10 +2185,6 @@ def _gfx1250_device_prereqs(device: torch.device | None) -> bool:
     return is_gfx1250_arch(arch) and has_triton_amd_tdm_device(arch)
 
 
-def _gfx1250_tdm_enabled(device: torch.device | None) -> bool:
-    return config.triton.enable_tdm and _gfx1250_device_prereqs(device)
-
-
 def _tdm_row_major_from_strides(strides_i: Sequence[sympy.Expr | int]) -> bool | None:
     """Classify an already-resolved 2D stride pair by its unit-stride dimension.
 
@@ -2327,7 +2323,9 @@ def use_triton_tdm_template(*matrices: IRNode) -> bool:
     size, stride or offset -- the operands are not specialized until
     ``commit_tdm_operand_layout`` runs against a materialized config set.
     """
-    if not matrices or not _gfx1250_tdm_enabled(matrices[0].get_device()):
+    if not matrices or not config.triton.enable_persistent_tma_matmul:
+        return False
+    if not _gfx1250_device_prereqs(matrices[0].get_device()):
         return False
     return _tdm_operands_compatible(
         matrices, _TDM_SUPPORTED_DTYPES, TDMGuardMode.BOUNDS
@@ -2351,8 +2349,7 @@ def commit_tdm_operand_layout(*matrices: IRNode) -> None:
 def use_gfx1250_descriptor_codegen(device: torch.device | None) -> bool:
     """Return whether generic tensor descriptor codegen may target AMD TDM."""
     return (
-        config.triton.enable_tdm
-        and config.triton.use_tensor_descriptor
+        config.triton.use_tensor_descriptor
         and config.assume_aligned_inputs
         and _gfx1250_device_prereqs(device)
     )
@@ -2365,7 +2362,7 @@ def use_flex_tdm_descriptor(
     """Return whether flex operands satisfy TDM descriptor and request constraints."""
     from .virtualized import V
 
-    if not matrices or not _gfx1250_tdm_enabled(matrices[0].get_device()):
+    if not matrices or not _gfx1250_device_prereqs(matrices[0].get_device()):
         return False
 
     if block_shapes is None:
