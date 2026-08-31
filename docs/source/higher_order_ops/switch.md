@@ -127,6 +127,19 @@ ep = torch.export.export(
 print(ep)
 ```
 
+## Batching with torch.vmap
+
+`torch.switch` supports `torch.vmap`, with two different lowerings depending on the index:
+
+- An unbatched index means all batch elements take the same branch. The switch is preserved,
+  the batching is pushed into the branches and only the selected branch runs.
+- A batched index selects a different branch per batch element, which a single switch cannot
+  express. All branches are evaluated on the whole batch and their outputs are selected
+  element-wise. Every branch must therefore be safe to evaluate for every batch element: in
+  particular, branches that are not selected can still contribute `inf` or `nan` to the
+  gradients. Non-tensor branch outputs cannot be selected element-wise, so `int` leaves must
+  have the same value in every branch.
+
 ## Invariants of torch.ops.higher_order.switch
 
 There are several useful invariants for `torch.ops.higher_order.switch`:

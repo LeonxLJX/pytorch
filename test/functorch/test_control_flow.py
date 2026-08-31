@@ -170,6 +170,24 @@ def _fake_while_loop(cond_fn, body_fn, operands):
     return operands
 
 
+def _fake_vmap_switch(index, branches, operands):
+    """Reference for vmap over switch: runs one branch per batch element and stacks.
+
+    ``index`` holds one index per batch element, truncated and clamped into
+    ``[0, len(branches))`` like torch.switch does, and ``operands`` are batched along
+    dim 0. Non-tensor output leaves are passed through instead of being stacked.
+    """
+    indices = [min(max(int(i), 0), len(branches) - 1) for i in index.flatten().tolist()]
+    args = list(zip(*operands)) if operands else [()] * len(indices)
+    outs = [branches[i](*a) for i, a in zip(indices, args)]
+    return pytree.tree_map(
+        lambda *leaves: torch.stack(leaves)
+        if isinstance(leaves[0], torch.Tensor)
+        else leaves[0],
+        *outs,
+    )
+
+
 def compile_mode_helper(fct, compile_mode):
     if compile_mode == "compile":
         return torch.compile(fct, fullgraph=True, dynamic=False)
@@ -10168,11 +10186,12 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             self.assertEqual(out[i], torch.stack([e[i] for e in expected]))
 
         # Verify gradients flow correctly through torch.where selection for all outputs.
-        # Use a single grad call to avoid retain_graph bookkeeping across outputs.
         all_out = [o.sum() for o in out]
-        all_expected = [torch.stack([e[i] for e in expected]).sum() for i in range(nOutputs)]
-        grads = torch.autograd.grad(all_out, [x], grad_outputs=[torch.ones(1)] * nOutputs)
-        expected_grads = torch.autograd.grad(all_expected, [x], grad_outputs=[torch.ones(1)] * nOutputs)
+        all_expected = [
+            torch.stack([e[i] for e in expected]).sum() for i in range(nOutputs)
+        ]
+        grads = torch.autograd.grad(all_out, [x], retain_graph=True)
+        expected_grads = torch.autograd.grad(all_expected, [x])
         self.assertEqual(grads, expected_grads, atol=1e-5, rtol=1e-5)
 
     @parametrize("boolcond", [True, False])
@@ -10191,6 +10210,363 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         a = torch.ones((3, 4, 5))
         res = torch.vmap(wrapper)(a)
         self.assertEqual(res, a + 1)
+
+    @parametrize(
+        "index_kind",
+        [
+            "unbatched_0",
+            "unbatched_1",
+            "unbatched_clamped",
+            "batched_int64",
+            "batched_int32",
+            "batched_float",
+            "batched_clamped",
+            "batched_trailing_dim",
+            "batched_size_one",
+        ],
+    )
+    def test_switch_vmap_index(self, index_kind):
+        c = torch.arange(5.0)
+        branches = (lambda x, y: x + y, lambda x, y: x - y + c, lambda x, y: x * y)
+        # Out-of-range indices are clamped into [0, len(branches) - 1] and
+        # non-integral indices are truncated, like int() in the dense impl.
+        index = {
+            "unbatched_0": torch.tensor([0]),
+            "unbatched_1": torch.tensor([1]),
+            "unbatched_clamped": torch.tensor([5]),
+            "batched_int64": torch.tensor([2, 0, 1]),
+            "batched_int32": torch.tensor([2, 0, 1], dtype=torch.int32),
+            "batched_float": torch.tensor([1.7, -3.0, 0.2]),
+            "batched_clamped": torch.tensor([-5, 7, 1]),
+            # A single-element instead of a 0-dim index per batch element.
+            "batched_trailing_dim": torch.tensor([[2], [0], [1]]),
+            "batched_size_one": torch.tensor([1]),
+        }[index_kind]
+        batched = index_kind.startswith("batched")
+
+        def fn(i, x, y):
+            return switch(i, branches, (x, y))
+
+        batch_size = index.shape[0] if batched else 3
+        x, y = torch.randn(batch_size, 5), torch.randn(batch_size, 5)
+        res = torch.vmap(fn, in_dims=(0 if batched else None, 0, 0))(index, x, y)
+        ref_index = index if batched else index.expand(batch_size)
+        self.assertEqual(res, _fake_vmap_switch(ref_index, branches, (x, y)))
+
+    @parametrize("batched_index", [True, False])
+    @parametrize("case", ["pytree", "scalar", "operand_independent", "non_tensor"])
+    def test_switch_vmap_output_structures(self, case, batched_index):
+        c = torch.arange(4.0)
+        branches = {
+            "pytree": (
+                lambda x: {"sum": x + c, "pair": (x - c, x.sin())},
+                # c.clone() does not depend on the operand, so this output comes
+                # back unbatched and has to be expanded to the batch size.
+                lambda x: {"sum": x * c, "pair": (c.clone(), x.cos())},
+            ),
+            "scalar": (lambda x: x.sum(), lambda x: x.max()),
+            "operand_independent": (lambda x: x + c, lambda x: c.clone()),
+            "non_tensor": (lambda x: (x + 1, None, 3), lambda x: (x * 2, None, 3)),
+        }[case]
+
+        structure = []
+
+        def fn(i, x):
+            out = switch(i, branches, (x,))
+            flat, spec = pytree.tree_flatten(out)
+            # vmap only allows tensors in the output, so the output structure and
+            # the non-tensor leaves are recorded here and checked below.
+            structure.append(
+                (spec, [leaf for leaf in flat if not isinstance(leaf, torch.Tensor)])
+            )
+            return [leaf for leaf in flat if isinstance(leaf, torch.Tensor)]
+
+        batch_size = 3
+        x = torch.randn(batch_size, 4)
+        index = torch.tensor([1, 0, 1]) if batched_index else torch.tensor([1])
+        res = torch.vmap(fn, in_dims=(0 if batched_index else None, 0))(index, x)
+
+        ref_index = index if batched_index else index.expand(batch_size)
+        expected = _fake_vmap_switch(ref_index, branches, (x,))
+        flat_expected, expected_spec = pytree.tree_flatten(expected)
+        self.assertEqual(len(structure), 1)
+        self.assertEqual(structure[0][0], expected_spec)
+        self.assertEqual(
+            structure[0][1],
+            [leaf for leaf in flat_expected if not isinstance(leaf, torch.Tensor)],
+        )
+        self.assertEqual(
+            res, [leaf for leaf in flat_expected if isinstance(leaf, torch.Tensor)]
+        )
+
+    @parametrize("batch_size", [1, 3])
+    @parametrize("batched_index", [True, False])
+    def test_switch_vmap_operand_independent_scalar(self, batch_size, batched_index):
+        # An operand-independent output comes back unbatched and is broadcast to the
+        # batch size. Broadcasting a scalar to a batch size of 1 leaves a stride 0
+        # view, which the branches of the HOP would disagree on, so the output has to
+        # be materialized.
+        branches = (lambda x: x.sum(), lambda x: torch.zeros(()))
+
+        def fn(i, x):
+            return switch(i, branches, (x,))
+
+        x = torch.randn(batch_size, 4)
+        index = torch.tensor([1, 0, 1][:batch_size] if batched_index else [1])
+        res = torch.vmap(fn, in_dims=(0 if batched_index else None, 0))(index, x)
+
+        ref_index = index if batched_index else index.expand(batch_size)
+        self.assertEqual(res, _fake_vmap_switch(ref_index, branches, (x,)))
+        # A stride 0 view reports as contiguous, so the layout is checked directly.
+        self.assertEqual(res.stride(), (1,))
+
+    @parametrize("batched_index", [True, False])
+    def test_switch_vmap_in_dims(self, batched_index):
+        branches = (lambda x, y: x + y, lambda x, y: x - y)
+
+        def fn(i, x, y):
+            return switch(i, branches, (x, y))
+
+        x = torch.randn(4, 3)
+        y = torch.randn(4)
+        # x is batched along dim 1, y is not batched at all.
+        if batched_index:
+            index = torch.tensor([[1, 0, 1]])
+            res = torch.vmap(fn, in_dims=(1, 1, None))(index, x, y)
+            expected = torch.stack(
+                [branches[i](x[:, b], y) for b, i in enumerate(index[0].tolist())]
+            )
+        else:
+            res = torch.vmap(fn, in_dims=(None, 1, None))(torch.tensor([1]), x, y)
+            expected = branches[1](x.movedim(1, 0), y)
+        self.assertEqual(res, expected)
+
+    def test_switch_vmap_no_operands(self):
+        c = torch.arange(4.0)
+        branches = (lambda: c + 1, lambda: c * 2)
+
+        def fn(i):
+            return switch(i, branches, ())
+
+        index = torch.tensor([0, 1, 1])
+        res = torch.vmap(fn)(index)
+        self.assertEqual(res, _fake_vmap_switch(index, branches, ()))
+
+    @skipIfTorchDynamo("counting branch calls mutates a list from outside the HOP")
+    def test_switch_vmap_branches_run(self):
+        # switch_op is called directly, so that the branches are only run by the
+        # batch rule and not by dynamo tracing them as well.
+        from torch._higher_order_ops.switch import switch_op
+
+        num_calls = [0, 0, 0]
+
+        def make_branch(i):
+            def branch(x):
+                num_calls[i] += 1
+                return x + i
+
+            return branch
+
+        branches = [make_branch(i) for i in range(3)]
+        x = torch.randn(3, 4)
+        res = torch.vmap(lambda y: switch_op(torch.tensor(1), branches, (y,)))(x)
+        self.assertEqual(res, x + 1)
+        self.assertEqual(num_calls, [0, 1, 0])
+
+        # A batched index cannot be expressed by a single switch, so all branches
+        # run and their outputs are selected element-wise.
+        num_calls[:] = [0, 0, 0]
+        index = torch.tensor([2, 0, 1])
+        res = torch.vmap(lambda i, y: switch_op(i, branches, (y,)))(index, x)
+        self.assertEqual(res, x + index[:, None])
+        self.assertEqual(num_calls, [1, 1, 1])
+
+    def test_switch_vmap_batched_index_divergent_int_output(self):
+        # With an unbatched index the int leaves are merged into an unbacked
+        # SymInt, but selecting outputs element-wise cannot do that.
+        def fn(i, x):
+            return switch(i, (lambda x: (x + 1, 3), lambda x: (x * 2, 4)), (x,))
+
+        with self.assertRaisesRegex(RuntimeError, "requires every branch to return"):
+            torch.vmap(fn)(torch.tensor([0, 1, 0]), torch.randn(3, 4))
+
+    @parametrize("batched_index", [True, False])
+    def test_switch_vmap_autograd(self, batched_index):
+        branches = (lambda x: x.sin(), lambda x: x.cos() * 2)
+
+        def fn(i, x):
+            return switch(i, branches, (x,))
+
+        x = torch.randn(3, 4, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        if batched_index:
+            index = torch.tensor([1, 0, 1])
+            res = torch.vmap(fn)(index, x)
+            expected = _fake_vmap_switch(index, branches, (x_ref,))
+        else:
+            res = torch.vmap(fn, in_dims=(None, 0))(torch.tensor([1]), x)
+            expected = branches[1](x_ref)
+        self.assertEqual(res, expected)
+        res.sum().backward()
+        expected.sum().backward()
+        self.assertEqual(x.grad, x_ref.grad)
+
+    @skipIfTorchDynamo("a vmap test, not a dynamo test")
+    def test_switch_vmap_per_sample_grads(self):
+        # vmap(grad(fn)) -- the canonical per-sample-gradients pattern.
+        branches = (lambda x: x.sin(), lambda x: x.cos() * 2)
+
+        def fn(i, x):
+            return switch(i, branches, (x,)).sum()
+
+        index = torch.tensor([1])
+        x = torch.randn(3, 4)
+        per_sample_grads = torch.vmap(
+            torch.func.grad(fn, argnums=1), in_dims=(None, 0)
+        )(index, x)
+        expected = torch.stack(
+            [torch.func.grad(fn, argnums=1)(index, x[i]) for i in range(3)]
+        )
+        self.assertEqual(per_sample_grads, expected, atol=1e-5, rtol=1e-5)
+
+    @parametrize("batched_index", [True, False])
+    def test_switch_vmap_compile(self, batched_index):
+        branches = (lambda x: x + 1, lambda x: x * 2, lambda x: -x)
+
+        def switch_fn(i, x):
+            return switch(i, branches, (x,))
+
+        def fn(i, x):
+            return torch.vmap(switch_fn, in_dims=(0 if batched_index else None, 0))(
+                i, x
+            )
+
+        index = torch.tensor([2, 0, 1]) if batched_index else torch.tensor([1])
+        x = torch.randn(3, 4)
+        expected = fn(index, x)
+        res = torch.compile(fn, backend="aot_eager", fullgraph=True)(index, x)
+        self.assertEqual(res, expected)
+
+    @parametrize("batched_index", [True, False])
+    @parametrize("randomness", ["different", "same", "error"])
+    def test_switch_vmap_randomness(self, randomness, batched_index):
+        from torch._higher_order_ops.switch import switch_op
+
+        # branch0 produces random output; branch1 is deterministic.
+        branches = [lambda x: x + torch.rand(4), lambda x: x.clone()]
+
+        if batched_index:
+            # index 0 and 2 select branch0 (random), index 1 selects branch1.
+            index = torch.tensor([0, 1, 0])
+            x = torch.zeros(3, 4)
+
+            def fn(i, x):
+                return switch_op(i, branches, (x,))
+
+            if randomness == "error":
+                with self.assertRaisesRegex(RuntimeError, "randomness"):
+                    torch.vmap(fn)(index, x)
+                return
+            res = torch.vmap(fn, randomness=randomness)(index, x)
+            if randomness == "same":
+                # Elements 0 and 2 both select branch0 and get the same random draw.
+                self.assertEqual(res[0], res[2])
+            else:
+                self.assertNotEqual(res[0], res[2])
+        else:
+            def fn(x):
+                return switch_op(torch.tensor(0), branches, (x,))
+
+            x = torch.zeros(3, 4)
+            if randomness == "error":
+                with self.assertRaisesRegex(RuntimeError, "randomness"):
+                    torch.vmap(fn)(x)
+                return
+            res = torch.vmap(fn, randomness=randomness)(x)
+            if randomness == "same":
+                self.assertEqual(res[0], res[1])
+                self.assertEqual(res[0], res[2])
+            else:
+                self.assertNotEqual(res[0], res[1])
+
+    @parametrize("batched_index", [True, False])
+    def test_switch_vmap_vmap(self, batched_index):
+        branches = (lambda x: x + 1, lambda x: x * 2)
+
+        def fn(i, x):
+            return switch(i, branches, (x,))
+
+        x = torch.randn(2, 3, 4)
+        if batched_index:
+            # The index is batched by both levels, so every element of the 2x3
+            # batch can take a different branch.
+            index = torch.tensor([[0, 1, 1], [1, 0, 1]])
+            res = torch.vmap(torch.vmap(fn))(index, x)
+            self.assertEqual(res, torch.where(index[..., None] == 1, x * 2, x + 1))
+        else:
+            res = torch.vmap(torch.vmap(fn, in_dims=(None, 0)), in_dims=(None, 0))(
+                torch.tensor([1]), x
+            )
+            self.assertEqual(res, x * 2)
+
+    @parametrize("batched_index", [True, False])
+    def test_switch_vmap_inside_scan(self, batched_index):
+        branches = (lambda carry, x: carry + x, lambda carry, x: carry * x)
+
+        def fn(i, init, xs):
+            def combine_fn(carry, x):
+                out = switch(i, branches, (carry, x))
+                return out, out.clone()
+
+            return scan(combine_fn, init, xs)
+
+        batch_size = 2
+        init, xs = torch.ones(batch_size, 3), torch.randn(batch_size, 4, 3)
+        if batched_index:
+            index = torch.tensor([1, 0])
+            res = torch.vmap(fn)(index, init, xs)
+        else:
+            index = torch.tensor([1, 1])
+            res = torch.vmap(fn, in_dims=(None, 0, 0))(torch.tensor([1]), init, xs)
+        expected = [
+            _fake_scan(
+                lambda carry, x: (branches[index[b]](carry, x),) * 2, init[b], xs[b]
+            )
+            for b in range(batch_size)
+        ]
+        self.assertEqual(res[0], torch.stack([e[0] for e in expected]))
+        self.assertEqual(res[1], torch.stack([e[1] for e in expected]))
+
+    def test_switch_vmap_nested_switch(self):
+        inner = (lambda x: x + 1, lambda x: x * 2)
+
+        def fn(i, x):
+            branches = tuple(
+                lambda x, branch=branch: switch(i, inner, (branch(x),))
+                for branch in inner
+            )
+            return switch(i, branches, (x,))
+
+        x = torch.randn(3, 4)
+        index = torch.tensor([0, 1, 1])
+        res = torch.vmap(fn)(index, x)
+        self.assertEqual(res, torch.where(index[:, None] == 1, x * 4, x + 2))
+
+    @requires_cuda
+    def test_switch_vmap_gpu(self):
+        branches = (lambda x: x + 1, lambda x: x * 2, lambda x: -x)
+
+        def fn(i, x):
+            return switch(i, branches, (x,))
+
+        x = torch.randn(3, 4, device="cuda")
+        index = torch.tensor([1], device="cuda")
+        res = torch.vmap(fn, in_dims=(None, 0))(index, x)
+        self.assertEqual(res, x * 2)
+
+        index = torch.tensor([2, 0, 1], device="cuda")
+        res = torch.vmap(fn)(index, x)
+        self.assertEqual(res, _fake_vmap_switch(index, branches, (x,)))
 
     def test_cond_trace_set__and_mutate_input(self):
         def f(a, tmp):
