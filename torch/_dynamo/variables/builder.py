@@ -1111,7 +1111,7 @@ class VariableBuilder:
             ErrorOnGraphBreakDecoratorContextManager,
         )
 
-        if has_triton():
+        if has_triton(include_cpu=True):
             from triton.runtime.autotuner import Autotuner
             from triton.runtime.jit import JITFunction
         else:
@@ -1144,7 +1144,7 @@ class VariableBuilder:
             )
         if has_triton_tensor_descriptor_host_tma():
             from triton.tools.tensor_descriptor import TensorDescriptor
-        if has_triton():
+        if has_triton(include_cpu=True):
             import triton as triton_mod
 
             if hasattr(triton_mod, "set_allocator"):
