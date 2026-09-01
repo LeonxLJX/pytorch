@@ -1140,6 +1140,11 @@ class AllocateLine(MemoryPlanningLine):
     def __post_init__(self):
         if V.graph.scheduler.current_node is None:
             raise AssertionError("expected scheduler.current_node to be set")
+        # Record the scheduler this index refers to: a subgraph inlined into the
+        # parent wrapper (invoke_subgraph / cond / while_loop) emits its lines
+        # into the parent's line list while V.graph is the SUBGRAPH, so indices
+        # from the two graphs are not comparable. See should_reuse_buffer.
+        self.scheduler = V.graph.scheduler
         self.scheduler_node_index = V.graph.scheduler.nodes.index(
             V.graph.scheduler.current_node
         )
@@ -1147,6 +1152,14 @@ class AllocateLine(MemoryPlanningLine):
     def should_reuse_buffer(self, free_line: FreeIfNotReusedLine, size: int) -> bool:
         if self.comm_buffer:
             return True
+        if free_line.scheduler is not self.scheduler:
+            # Cross-graph pair (e.g. a buffer freed in the parent and a buffer
+            # allocated inside an inlined nested region). The two
+            # scheduler_node_index values index different node lists, so both
+            # the adjacency test and the peak-memory range below are
+            # meaningless -- summarize_range would raise on an inverted range.
+            # Be conservative and do not reuse.
+            return False
         if free_line.scheduler_node_index + 1 == self.scheduler_node_index:
             return True
         overall_peak_memory = self.wrapper.estimate_peak.overall_peak_memory
@@ -1264,6 +1277,9 @@ class FreeIfNotReusedLine(MemoryPlanningLine):
     def __post_init__(self):
         if V.graph.scheduler.current_node is None:
             raise AssertionError("expected scheduler.current_node to be set")
+        # See AllocateLine.__post_init__ -- the index is only meaningful
+        # relative to this scheduler's node list.
+        self.scheduler = V.graph.scheduler
         self.scheduler_node_index = V.graph.scheduler.nodes.index(
             V.graph.scheduler.current_node
         )

@@ -362,6 +362,28 @@ class AOTInductorTestsTemplate:
                 model, example_inputs, "AOTInductorModelRunMinimalArrayrefInterface(", 1
             )
 
+    def test_invoke_subgraph_nested_region(self):
+        # AOTI compile + load + run of a model containing a nested compile
+        # region. Before CppWrapperCpu.codegen_invoke_subgraph existed this
+        # raised "codegen invoke_subgraph is not implemented for cpp wrapper".
+        # check_model exercises the full round trip, including dlopen, so this
+        # covers what a codegen-only assertion cannot.
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                return torch.cos(gn(x * 2))
+
+        with torch._dynamo.config.patch(
+            enable_invoke_subgraph_regional_compile=True,
+            inline_single_use_invoke_subgraph=False,
+        ):
+
+            @torch.compiler.nested_compile_region
+            def gn(x):
+                return torch.sin(x) + 1
+
+            example_inputs = (torch.randn(8, 8, device=self.device),)
+            self.check_model(Model(), example_inputs)
+
     @common_utils.parametrize("embed_kernel_binary", [False, True])
     def test_loaded_modules_tracking(self, embed_kernel_binary):
         # Verify that AOTI codegen on CUDA/HIP passes &kernels_.loaded_modules_

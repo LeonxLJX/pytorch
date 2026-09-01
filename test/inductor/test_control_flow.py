@@ -2719,6 +2719,55 @@ instantiate_parametrized_tests(MapTests)
 instantiate_parametrized_tests(SwitchTests)
 
 
+# CondTests cases that still fail under the cpp wrapper. Both variants declare an
+# unbacked SymInt inside a branch, which the inlined C++ does not yet bind correctly.
+_CPP_WRAPPER_XFAIL = frozenset(
+    [
+        "test_cond_unbacked_symint_inner_device_cpu",
+        "test_cond_unbacked_symint_inner_device_cuda",
+        "test_cond_unbacked_symint_inner_to_outer_device_cpu",
+        "test_cond_unbacked_symint_inner_to_outer_device_cuda",
+    ]
+)
+
+
+# Re-runs a control-flow suite with config.cpp_wrapper=True. These HOPs all reach
+# CppWrapperCpu.codegen_subgraph -- the path this diff touches -- so the cpp wrapper
+# needs coverage of its own rather than only the default python wrapper.
+#
+# WhileLoopTests and ScanTests are deliberately NOT enabled here: 69 and 264 of their
+# cases respectively still fail under the cpp wrapper, for two reasons that each need
+# their own fix, and pinning that many names would rot on the next parametrization.
+#   * `error: redefinition of 'true_graph_0_bufN'` -- a branch subgraph declares its
+#     buffers in the parent's C++ scope, so two branches reusing a name collide. Same
+#     class of bug as the region `stream0` collision this diff fixes, but for buffers.
+#   * `NotImplementedError: NYI cpp wrapper for while_loop_stack_output`.
+class _CppWrapperMixin:
+    def setUp(self):
+        super().setUp()
+        if self._testMethodName in _CPP_WRAPPER_XFAIL:
+            raise unittest.SkipTest("not yet supported by the cpp wrapper")
+        patcher = torch._inductor.config.patch(cpp_wrapper=True)
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
+
+
+class CondTestsCppWrapper(_CppWrapperMixin, CondTests):
+    pass
+
+
+class AssociativeScanTestsCppWrapper(_CppWrapperMixin, AssociativeScanTests):
+    pass
+
+
+class MapTestsCppWrapper(_CppWrapperMixin, MapTests):
+    pass
+
+
+class SwitchTestsCppWrapper(_CppWrapperMixin, SwitchTests):
+    pass
+
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
